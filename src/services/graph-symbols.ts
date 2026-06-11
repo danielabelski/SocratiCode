@@ -399,6 +399,11 @@ function extractFromDart(
   };
 
   // ── Top-level declarations (ordered walk so signature/body pairs line up) ──
+  // Dart 3.3 `extension type` is NOT handled: the vendored grammar
+  // (@ast-grep/lang-dart 0.0.7) predates the syntax and parses it to ERROR
+  // nodes (no extension_type_declaration kind exists), so such declarations
+  // degrade to "not extracted" while the rest of the file extracts normally.
+  // Revisit when the upstream grammar adds the kind.
   const topLevel = kidsOf(root);
   for (let i = 0; i < topLevel.length; i++) {
     const node = topLevel[i];

@@ -575,6 +575,26 @@ void main() {
       expect(callees).toContain("helper");
     });
 
+    it("degrades gracefully on Dart 3.3 extension types (unsupported by grammar 0.0.7)", () => {
+      // The vendored tree-sitter grammar predates `extension type` and parses
+      // it to ERROR nodes. The contract: no throw, no bogus symbols from the
+      // ERROR region, and the rest of the file still extracts normally.
+      const src = `
+extension type Meters(int value) {
+  int get inKm => value ~/ 1000;
+}
+
+class Real {
+  void work() {}
+}
+`;
+      const out = extractSymbolsAndCalls(src, "dart" as unknown as Lang, ".dart", "lib/m.dart");
+      expect(out.symbols.some((s) => s.qualifiedName === "Real" && s.kind === "class")).toBe(true);
+      expect(out.symbols.some((s) => s.qualifiedName === "Real.work" && s.kind === "method")).toBe(true);
+      // The unsupported declaration produces no symbol named Meters
+      expect(out.symbols.some((s) => s.name === "Meters")).toBe(false);
+    });
+
     it("detects main() so Dart apps get a conventional entry point", () => {
       const src = `
 void main() {
