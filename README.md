@@ -753,6 +753,16 @@ across MCP configs), **fallback / load balancing** between embedding backends, o
 > through the proxy (only safe for Matryoshka-aware backends like `text-embedding-3-*` or
 > `voyage-3` — non-Matryoshka backends reject the request).
 
+> **This is a client for the LiteLLM _proxy server_, not the LiteLLM Python library, and it does
+> not route `provider/model` strings itself.** It sends `EMBEDDING_MODEL` to `LITELLM_URL`
+> verbatim and requires that name to appear in the proxy's `/v1/models`. To reach a backend such
+> as OpenRouter, register it in the proxy's `config.yaml` `model_list` (set `model_name` to the
+> value you put in `EMBEDDING_MODEL`, and `litellm_params.model` to e.g.
+> `openrouter/qwen/qwen3-embedding-8b`); the proxy does the routing and SocratiCode just sends the
+> alias. Pointing `LITELLM_URL` directly at a non-LiteLLM endpoint works only if that endpoint is
+> OpenAI-compatible, lists your `EMBEDDING_MODEL` under `/v1/models`, and accepts it under its own
+> native model id (no LiteLLM `provider/` prefix).
+
 ### Git Worktrees (shared index across directories)
 
 If you use [git worktrees](https://git-scm.com/docs/git-worktree) — or any workflow where the same repository lives in multiple directories — each path would normally get its own Qdrant index. This means redundant embedding and storage for what is essentially the same codebase.
