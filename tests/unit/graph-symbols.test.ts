@@ -2,12 +2,14 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
 import { Lang } from "@ast-grep/napi";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { ensureDynamicLanguages } from "../../src/services/code-graph.js";
 import {
   extractSymbolsAndCalls,
   rawCallsToUnresolvedEdges,
+  resetSymbolExtractionWarnings,
 } from "../../src/services/graph-symbols.js";
+import { logger } from "../../src/services/logger.js";
 
 beforeAll(() => {
   ensureDynamicLanguages();
@@ -605,6 +607,111 @@ void main() {
       const main = out.symbols.find((s) => s.name === "main");
       expect(main).toBeDefined();
       expect(main?.kind).toBe("function");
+    });
+
+    it("extracts abstract bodyless getters, setters, and methods (#74)", () => {
+      // Bodyless members parse as `declaration > <signature>` (no function_body),
+      // which the original extractor skipped. They are common in Dart interfaces
+      // and abstract classes.
+      const src = `
+abstract class Repo {
+  Future<int> load();
+  int get count;
+  set name(String v);
+  void clear() {}
+}
+`;
+      const out = extractSymbolsAndCalls(src, "dart" as unknown as Lang, ".dart", "lib/repo.dart");
+      const has = (qn: string, kind: string) =>
+        out.symbols.some((s) => s.qualifiedName === qn && s.kind === kind);
+      expect(has("Repo", "class")).toBe(true);
+      expect(has("Repo.load", "method")).toBe(true); // abstract method
+      expect(has("Repo.count", "method")).toBe(true); // abstract getter
+      expect(has("Repo.name", "method")).toBe(true); // abstract setter
+      expect(has("Repo.clear", "method")).toBe(true); // concrete method still works
+    });
+
+    it("extracts operators (with and without a body), named by their token (#74)", () => {
+      // Operators are not named by an identifier; the symbol is `operator<token>`.
+      const src = `
+class Vec {
+  Vec operator +(Vec o) => o;
+  bool operator ==(Object o) => true;
+  num operator [](int i) => i;
+  Vec operator -(Vec o);
+}
+`;
+      const out = extractSymbolsAndCalls(src, "dart" as unknown as Lang, ".dart", "lib/vec.dart");
+      const qns = out.symbols.map((s) => s.qualifiedName);
+      expect(qns).toContain("Vec.operator+"); // binary, with body
+      expect(qns).toContain("Vec.operator=="); // equality, with body
+      expect(qns).toContain("Vec.operator[]"); // index, with body
+      expect(qns).toContain("Vec.operator-"); // abstract (bodyless) operator
+      for (const s of out.symbols) {
+        if (s.qualifiedName.startsWith("Vec.operator")) expect(s.kind).toBe("method");
+      }
+    });
+
+    it("does not regress fields, constructors, or getters-with-body (#74)", () => {
+      // The new abstract-member handling must not change anything that already
+      // worked, and must keep skipping plain fields.
+      const src = `
+class Foo {
+  int count = 0;
+  Foo(this.count);
+  factory Foo.create() => Foo(0);
+  String get label => "x";
+}
+`;
+      const out = extractSymbolsAndCalls(src, "dart" as unknown as Lang, ".dart", "lib/foo.dart");
+      const has = (qn: string, kind: string) =>
+        out.symbols.some((s) => s.qualifiedName === qn && s.kind === kind);
+      expect(has("Foo", "class")).toBe(true);
+      expect(has("Foo.create", "constructor")).toBe(true);
+      expect(has("Foo.label", "method")).toBe(true); // getter with body
+      // Field `count` is not callable and must NOT become a symbol.
+      expect(out.symbols.some((s) => s.qualifiedName === "Foo.count")).toBe(false);
+    });
+
+    it("recovers sibling classes when an unparseable sealed class is present (#74)", () => {
+      // sealed class is Dart 3 syntax the grammar cannot parse. It is lost, but
+      // the regular classes and enums around it must still be extracted, not
+      // zeroed out. This pins the partial-degradation behavior.
+      const src = `
+class Before { void a() {} }
+
+sealed class Sealed { int get id; }
+
+class After { void b() {} }
+
+enum Color { red, green }
+`;
+      const out = extractSymbolsAndCalls(src, "dart" as unknown as Lang, ".dart", "lib/mixed.dart");
+      expect(out.symbols.some((s) => s.qualifiedName === "Before" && s.kind === "class")).toBe(true);
+      expect(out.symbols.some((s) => s.qualifiedName === "Before.a" && s.kind === "method")).toBe(true);
+      expect(out.symbols.some((s) => s.qualifiedName === "After" && s.kind === "class")).toBe(true);
+      expect(out.symbols.some((s) => s.qualifiedName === "After.b" && s.kind === "method")).toBe(true);
+      expect(out.symbols.some((s) => s.qualifiedName === "Color" && s.kind === "enum")).toBe(true);
+      // The sealed class itself cannot be parsed by this grammar version.
+      expect(out.symbols.some((s) => s.qualifiedName === "Sealed")).toBe(false);
+    });
+
+    it("warns once (not per file) when Dart files contain unparseable syntax (#74)", () => {
+      resetSymbolExtractionWarnings();
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+      try {
+        const sealed = "sealed class A { int get id; }\n";
+        extractSymbolsAndCalls(sealed, "dart" as unknown as Lang, ".dart", "lib/a.dart");
+        extractSymbolsAndCalls(sealed, "dart" as unknown as Lang, ".dart", "lib/b.dart");
+        const dartWarns = warnSpy.mock.calls.filter(([msg]) =>
+          typeof msg === "string" && msg.includes("@ast-grep/lang-dart"),
+        );
+        // Two files with errors, but the process-level dedup emits exactly one warn.
+        expect(dartWarns).toHaveLength(1);
+      } finally {
+        warnSpy.mockRestore();
+        resetSymbolExtractionWarnings();
+      }
     });
   });
 

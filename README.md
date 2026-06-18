@@ -963,7 +963,7 @@ JavaScript, TypeScript, TSX, Python, Java, Kotlin, Scala, C, C++, C#, Go, Rust, 
 
 Svelte and Vue: imports extracted from `<script>` blocks (re-parsed as TypeScript) and CSS `@import`/`@require` from `<style>` blocks (any combination of `lang`, `scoped`, `module`, `global` attributes). Path aliases from `tsconfig.json`/`jsconfig.json` `compilerOptions.paths` are resolved (including `extends` chains). SCSS partial resolution (`_` prefix convention) is supported.
 
-Dart: symbols (classes, mixins, enums, extensions, typedefs, functions, getters/setters, constructors including named and factory), call sites (method calls, cascades, constructor invocations), `main()` entry-point detection, and AST chunking are all tree-sitter based; import/export/part edges are extracted via regex.
+Dart: symbols (classes, mixins, enums, extensions, typedefs, functions, getters, setters, operators, constructors including named and factory, and abstract/bodyless members), call sites (method calls, cascades, constructor invocations), `main()` entry-point detection, and AST chunking are all tree-sitter based; import/export/part edges are extracted via regex. The bundled grammar (`@ast-grep/lang-dart`) predates Dart 3 class modifiers (`sealed`/`base`/`interface`/`final`/`mixin class`) and `extension type`: declarations using those are skipped (with a one-time warning logged) until the upstream grammar is updated, while the rest of each file still indexes normally.
 
 ### Code Graph via Regex + Indexing
 

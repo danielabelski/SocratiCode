@@ -61,11 +61,22 @@ interface ScopeFrame {
 const symbolExtractionWarned = new Set<string>();
 
 /**
+ * Warn-once flag for Dart files the bundled grammar cannot fully parse. The
+ * `@ast-grep/lang-dart` grammar predates Dart 3, so files using Dart 3 class
+ * modifiers (sealed/base/interface/final/mixin class) or extension types
+ * produce ERROR nodes and lose symbols. We surface this once per process at
+ * warn level (per-file detail goes to debug) so the failure is not silent,
+ * without spamming one warn per affected file on large Flutter projects.
+ */
+let dartParseErrorWarned = false;
+
+/**
  * Reset the per-language dedupe set. Intended for tests that want to assert
  * deterministically on extraction warnings.
  */
 export function resetSymbolExtractionWarnings(): void {
   symbolExtractionWarned.clear();
+  dartParseErrorWarned = false;
 }
 
 /** Find the deepest scope frame covering a line. */
@@ -303,6 +314,24 @@ function extractFromDart(
   const symbols: SymbolNode[] = [moduleSym];
   const scopes: ScopeFrame[] = [];
 
+  // Surface (not silently swallow) files the grammar cannot fully parse.
+  // ERROR nodes for Dart almost always mean Dart 3 syntax the bundled grammar
+  // predates; the affected declarations lose their symbols. Per-file detail at
+  // debug, a single warn per process so big Flutter repos are not spammed.
+  const parseErrors = safeFindAll(root, "ERROR").length;
+  if (parseErrors > 0) {
+    logger.debug("Dart file has parse errors; some symbols skipped (likely Dart 3 syntax unsupported by the grammar)", {
+      file,
+      parseErrors,
+    });
+    if (!dartParseErrorWarned) {
+      dartParseErrorWarned = true;
+      logger.warn(
+        "Some Dart files use syntax the bundled grammar (@ast-grep/lang-dart) cannot parse — likely Dart 3 class modifiers (sealed/base/interface/final/mixin class) or extension types. Symbols in those regions are skipped until the upstream grammar is updated.",
+      );
+    }
+  }
+
   // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
   const kidsOf = (n: any): any[] => {
     try {
@@ -322,6 +351,19 @@ function extractFromDart(
   const idChildren = (n: any): any[] =>
     // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
     kidsOf(n).filter((c: any) => c.kind() === "identifier");
+
+  // Operators are not named by an identifier: the name is the token after the
+  // `operator` keyword (e.g. `+`, `==`, `[]`). Build "operator<tok>" so the
+  // symbol is `Owner.operator+` etc. Returns null when the shape is unexpected.
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const operatorName = (sig: any): string | null => {
+    const kids = kidsOf(sig);
+    // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+    const opIdx = kids.findIndex((c: any) => c.kind() === "operator");
+    if (opIdx < 0 || opIdx + 1 >= kids.length) return null;
+    const tok = kids[opIdx + 1].text().replace(/\s+/g, "");
+    return tok ? `operator${tok}` : null;
+  };
 
   const addSym = (
     name: string,
@@ -351,9 +393,11 @@ function extractFromDart(
 
   /**
    * Emit the member symbols of a class-like body. Members come in ordered
-   * sibling pairs: a `method_signature` (wrapping function/getter/setter/
-   * factory signatures) or a `declaration` (fields and plain constructors),
-   * optionally followed by its `function_body`.
+   * sibling pairs: a `method_signature` (wrapping function / getter / setter /
+   * operator / factory signatures) or a `declaration` (a plain constructor, an
+   * abstract bodyless member, or a field), optionally followed by its
+   * `function_body`. Bodyless abstract members and operators live under
+   * `declaration`; fields are skipped.
    */
   // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
   const walkMembers = (bodyNode: any, owner: string): void => {
@@ -374,6 +418,11 @@ function extractFromDart(
           // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
           const qn = ids.map((c: any) => c.text()).join(".");
           addSym(ids[ids.length - 1].text(), qn, "constructor", lineOf(member), scopeEnd);
+        } else if (innerKind === "operator_signature") {
+          // `T operator +(T o) { ... }` — operators are not named by an identifier.
+          const name = operatorName(inner);
+          if (!name) continue;
+          addSym(name, `${owner}.${name}`, "method", lineOf(member), scopeEnd);
         } else if (
           innerKind === "function_signature" ||
           innerKind === "getter_signature" ||
@@ -385,25 +434,46 @@ function extractFromDart(
           addSym(name, `${owner}.${name}`, "method", lineOf(member), scopeEnd);
         }
       } else if (memberKind === "declaration") {
-        // Plain (possibly named) constructors: `Foo(this.c);` / `Foo.named(...)`.
-        // Field declarations have no constructor_signature child and are skipped.
+        // A `declaration` member is one of:
+        //   - a plain/named constructor:     `constructor_signature`
+        //   - an abstract (bodyless) member:  `function_signature` /
+        //     `getter_signature` / `setter_signature` / `operator_signature`
+        //     (e.g. `void foo();`, `int get x;`, `set y(int v);`, `T operator +(T o);`)
+        //   - a field (type + initializer, no signature child): skipped
         const ctor = childOfKind(member, "constructor_signature");
-        if (!ctor) continue;
-        const ids = idChildren(ctor);
-        if (ids.length === 0) continue;
-        // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
-        const qn = ids.map((c: any) => c.text()).join(".");
-        addSym(ids[ids.length - 1].text(), qn, "constructor", lineOf(member), scopeEnd);
+        if (ctor) {
+          const ids = idChildren(ctor);
+          if (ids.length === 0) continue;
+          // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+          const qn = ids.map((c: any) => c.text()).join(".");
+          addSym(ids[ids.length - 1].text(), qn, "constructor", lineOf(member), scopeEnd);
+          continue;
+        }
+        const sig =
+          childOfKind(member, "function_signature") ??
+          childOfKind(member, "getter_signature") ??
+          childOfKind(member, "setter_signature") ??
+          childOfKind(member, "operator_signature");
+        if (!sig) continue; // field or unrecognized shape — skip, as before
+        const name =
+          sig.kind() === "operator_signature"
+            ? operatorName(sig)
+            : (idChildren(sig).at(-1)?.text() ?? null);
+        if (!name) continue;
+        addSym(name, `${owner}.${name}`, "method", lineOf(member), scopeEnd);
       }
     }
   };
 
   // ── Top-level declarations (ordered walk so signature/body pairs line up) ──
-  // Dart 3.3 `extension type` is NOT handled: the vendored grammar
-  // (@ast-grep/lang-dart 0.0.7) predates the syntax and parses it to ERROR
-  // nodes (no extension_type_declaration kind exists), so such declarations
-  // degrade to "not extracted" while the rest of the file extracts normally.
-  // Revisit when the upstream grammar adds the kind.
+  // Dart 3 class modifiers (`sealed` / `base` / `interface` / `final` /
+  // `mixin class`) and `extension type` are NOT handled: the vendored grammar
+  // (@ast-grep/lang-dart 0.0.7, latest published) predates them and parses
+  // them to ERROR nodes (no `sealed_class_declaration` /
+  // `extension_type_declaration` kinds exist). The affected declaration is
+  // dropped, and depending on parser recovery it can also drop following
+  // sibling classes; the rest of the file still extracts. The ERROR count is
+  // surfaced via the warn above. Revisit when the upstream grammar updates.
   const topLevel = kidsOf(root);
   for (let i = 0; i < topLevel.length; i++) {
     const node = topLevel[i];
