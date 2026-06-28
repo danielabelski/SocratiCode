@@ -4,6 +4,20 @@ All notable changes to SocratiCode are documented here.
 This project uses [Conventional Commits](https://www.conventionalcommits.org/) and [Semantic Versioning](https://semver.org/).
 
 
+## [1.8.18](https://github.com/giancarloerra/socraticode/compare/v1.8.17...v1.8.18) (2026-06-28)
+
+### Features
+
+* **indexing:** map custom extensions to languages via EXTENSION_LANGUAGE_MAP ([#77](https://github.com/giancarloerra/socraticode/issues/77)) ([1c5ddf5](https://github.com/giancarloerra/socraticode/commit/1c5ddf52be635eefe95a8a228f8b6db9ecc87a04))
+
+### Bug Fixes
+
+* **indexing:** normalize extension casing and tighten docs/test ([#77](https://github.com/giancarloerra/socraticode/issues/77)) ([c2c616f](https://github.com/giancarloerra/socraticode/commit/c2c616f4a33b8d5ed48ad32cb1988bde2f244ec0))
+
+### Documentation
+
+* **embeddings:** clarify the LiteLLM provider is a proxy-server client ([#76](https://github.com/giancarloerra/socraticode/issues/76)) ([0dc244e](https://github.com/giancarloerra/socraticode/commit/0dc244e89ad50c10a01c15183cf0c6ea2fc87fa9))
+
 ## [1.8.17](https://github.com/giancarloerra/socraticode/compare/v1.8.16...v1.8.17) (2026-06-18)
 
 ### Bug Fixes
