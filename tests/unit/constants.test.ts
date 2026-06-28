@@ -14,6 +14,7 @@ import {
   OLLAMA_HOST,
   OLLAMA_IMAGE,
   OLLAMA_PORT,
+  parseExtensionLanguageMap,
   parseExtraExtensions,
   QDRANT_CONTAINER_NAME,
   QDRANT_GRPC_PORT,
@@ -317,6 +318,76 @@ describe("constants", () => {
 
     it("maps .php to php", () => {
       expect(getLanguageFromExtension(".php")).toBe("php");
+    });
+
+    it("resolves an EXTENSION_LANGUAGE_MAP override to the target language label", () => {
+      const override = new Map([[".inc", ".php"]]);
+      expect(getLanguageFromExtension(".inc", override)).toBe("php");
+      // Unmapped extensions are unaffected by the override.
+      expect(getLanguageFromExtension(".xyz", override)).toBe("plaintext");
+    });
+
+    it("an empty override leaves built-in mappings unchanged", () => {
+      const empty = new Map<string, string>();
+      expect(getLanguageFromExtension(".inc", empty)).toBe("plaintext");
+      expect(getLanguageFromExtension(".ts", empty)).toBe("typescript");
+    });
+  });
+
+  describe("parseExtensionLanguageMap", () => {
+    it("returns empty map and no invalid entries for undefined/empty", () => {
+      expect(parseExtensionLanguageMap(undefined)).toEqual({ map: new Map(), invalid: [] });
+      expect(parseExtensionLanguageMap("  ")).toEqual({ map: new Map(), invalid: [] });
+    });
+
+    it("maps an extension to its target language's canonical extension", () => {
+      const { map, invalid } = parseExtensionLanguageMap(".inc:php");
+      expect(map.get(".inc")).toBe(".php");
+      expect(invalid).toEqual([]);
+    });
+
+    it("normalizes the extension (lowercases, adds leading dot)", () => {
+      const { map } = parseExtensionLanguageMap("MODULE:php");
+      expect(map.get(".module")).toBe(".php");
+    });
+
+    it("resolves the vocabulary difference via canonical extension", () => {
+      // `shell` label vs `bash` grammar, and the Lang-enum languages, are all
+      // reached through the canonical extension, not re-encoded here.
+      const { map } = parseExtensionLanguageMap(".bashrc:shell,.component:typescript");
+      expect(map.get(".bashrc")).toBe(".sh");
+      expect(map.get(".component")).toBe(".ts");
+    });
+
+    it("accepts common language aliases", () => {
+      const { map } = parseExtensionLanguageMap(".a:c++,.b:c#,.c:golang,.d:py");
+      expect(map.get(".a")).toBe(".cpp");
+      expect(map.get(".b")).toBe(".cs");
+      expect(map.get(".c")).toBe(".go");
+      expect(map.get(".d")).toBe(".py");
+    });
+
+    it("rejects a target language with no AST grammar (e.g. the reporter's .foo:bar)", () => {
+      const { map, invalid } = parseExtensionLanguageMap(".foo:bar,.txt:markdown");
+      expect(map.size).toBe(0);
+      expect(invalid).toEqual([".foo:bar", ".txt:markdown"]);
+    });
+
+    it("rejects malformed entries (no colon, no extension, no language)", () => {
+      const { map, invalid } = parseExtensionLanguageMap("badentry,:php,.x:");
+      expect(map.size).toBe(0);
+      expect(invalid).toEqual(["badentry", ":php", ".x:"]);
+    });
+
+    it("keeps valid entries while rejecting invalid ones in the same value", () => {
+      const { map, invalid } = parseExtensionLanguageMap(".inc:php, .foo:bar, .h:cpp");
+      expect([...map.entries()]).toEqual([[".inc", ".php"], [".h", ".cpp"]]);
+      expect(invalid).toEqual([".foo:bar"]);
+    });
+
+    it("last value wins for a repeated extension", () => {
+      const { map } = parseExtensionLanguageMap(".inc:php,.inc:python");
+      expect(map.get(".inc")).toBe(".py");
     });
   });
 

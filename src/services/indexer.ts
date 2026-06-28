@@ -10,6 +10,7 @@ import { collectionName, projectIdFromPath } from "../config.js";
 import {
   CHUNK_OVERLAP,
   CHUNK_SIZE,
+  EXTENSION_LANGUAGE_MAP,
   EXTRA_EXTENSIONS,
   getLanguageFromExtension,
   INDEX_BATCH_SIZE,
@@ -239,6 +240,9 @@ export function isIndexableFile(fileName: string, extraExts?: Set<string>): bool
   if (SPECIAL_FILES.has(fileName)) return true;
   const ext = path.extname(fileName).toLowerCase();
   if (SUPPORTED_EXTENSIONS.has(ext)) return true;
+  // Extensions mapped to a real language via EXTENSION_LANGUAGE_MAP are
+  // first-class source files, not plaintext extras.
+  if (EXTENSION_LANGUAGE_MAP.has(ext)) return true;
   // Check extra extensions (from env var + tool parameter)
   const extras = extraExts ?? EXTRA_EXTENSIONS;
   return extras.has(ext);

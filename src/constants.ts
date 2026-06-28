@@ -265,31 +265,131 @@ export const SPECIAL_FILES = new Set([
 ]);
 
 /** Map file extension to human-readable language name */
-export function getLanguageFromExtension(ext: string): string {
-  const map: Record<string, string> = {
-    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
-    ".ts": "typescript", ".tsx": "typescript",
-    ".py": "python", ".pyw": "python", ".pyi": "python",
-    ".java": "java", ".kt": "kotlin", ".kts": "kotlin", ".scala": "scala",
-    ".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".hh": "cpp", ".cxx": "cpp",
-    ".cs": "csharp",
-    ".go": "go",
-    ".rs": "rust",
-    ".rb": "ruby",
-    ".php": "php",
-    ".swift": "swift",
-    ".sh": "shell", ".bash": "shell", ".zsh": "shell",
-    ".html": "html", ".htm": "html",
-    ".css": "css", ".scss": "scss", ".sass": "sass", ".less": "less",
-    ".vue": "vue", ".svelte": "svelte",
-    ".json": "json", ".yaml": "yaml", ".yml": "yaml",
-    ".toml": "toml", ".xml": "xml",
-    ".md": "markdown", ".mdx": "markdown", ".rst": "rst",
-    ".sql": "sql",
-    ".dart": "dart",
-    ".lua": "lua",
-    ".r": "r", ".R": "r",
-    ".dockerfile": "dockerfile",
-  };
-  return map[ext] || "plaintext";
+/** Canonical file-extension → language-label map. */
+const EXTENSION_TO_LANGUAGE: Record<string, string> = {
+  ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+  ".ts": "typescript", ".tsx": "typescript",
+  ".py": "python", ".pyw": "python", ".pyi": "python",
+  ".java": "java", ".kt": "kotlin", ".kts": "kotlin", ".scala": "scala",
+  ".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".hh": "cpp", ".cxx": "cpp",
+  ".cs": "csharp",
+  ".go": "go",
+  ".rs": "rust",
+  ".rb": "ruby",
+  ".php": "php",
+  ".swift": "swift",
+  ".sh": "shell", ".bash": "shell", ".zsh": "shell",
+  ".html": "html", ".htm": "html",
+  ".css": "css", ".scss": "scss", ".sass": "sass", ".less": "less",
+  ".vue": "vue", ".svelte": "svelte",
+  ".json": "json", ".yaml": "yaml", ".yml": "yaml",
+  ".toml": "toml", ".xml": "xml",
+  ".md": "markdown", ".mdx": "markdown", ".rst": "rst",
+  ".sql": "sql",
+  ".dart": "dart",
+  ".lua": "lua",
+  ".r": "r", ".R": "r",
+  ".dockerfile": "dockerfile",
+};
+
+/**
+ * Language name → a canonical extension that already carries that language's
+ * label and AST grammar in {@link EXTENSION_TO_LANGUAGE} / `getAstGrepLang`.
+ * Used by EXTENSION_LANGUAGE_MAP so a custom extension inherits BOTH the label
+ * and the grammar consistently, without us re-encoding the (deliberately
+ * different) vocabularies of the two maps (`shell` vs `bash`, `Lang` enums for
+ * JS/TS/HTML/CSS). Only languages with an AST grammar are listed — mapping to
+ * anything else would give no benefit over EXTRA_EXTENSIONS.
+ */
+const LANGUAGE_TO_CANONICAL_EXT: Record<string, string> = {
+  javascript: ".js", js: ".js",
+  typescript: ".ts", ts: ".ts",
+  tsx: ".tsx",
+  python: ".py", py: ".py",
+  java: ".java",
+  kotlin: ".kt",
+  scala: ".scala",
+  c: ".c",
+  cpp: ".cpp", "c++": ".cpp",
+  csharp: ".cs", "c#": ".cs",
+  go: ".go", golang: ".go",
+  rust: ".rs",
+  ruby: ".rb",
+  php: ".php",
+  swift: ".swift",
+  dart: ".dart",
+  lua: ".lua",
+  shell: ".sh", bash: ".sh", sh: ".sh",
+  html: ".html",
+  css: ".css", scss: ".scss", sass: ".sass", less: ".less",
+  vue: ".vue",
+  svelte: ".svelte",
+};
+
+/**
+ * Parse the `EXTENSION_LANGUAGE_MAP` env var (format `.inc:php,.module:php`).
+ * Returns a map of input extension → canonical extension of the target
+ * language, plus the list of entries that were rejected (malformed, or a
+ * target language with no AST grammar) so the caller can warn loudly.
+ * Extensions are normalized (lowercased, leading dot ensured); a repeated
+ * extension takes its last value.
+ */
+export function parseExtensionLanguageMap(value?: string): {
+  map: Map<string, string>;
+  invalid: string[];
+} {
+  const map = new Map<string, string>();
+  const invalid: string[] = [];
+  if (!value?.trim()) return { map, invalid };
+
+  for (const pair of value.split(",")) {
+    const trimmed = pair.trim();
+    if (!trimmed) continue;
+    const idx = trimmed.indexOf(":");
+    // Need a non-empty extension before ":" and a non-empty language after it.
+    if (idx <= 0 || idx === trimmed.length - 1) {
+      invalid.push(trimmed);
+      continue;
+    }
+    const rawExt = trimmed.slice(0, idx).trim().toLowerCase();
+    const lang = trimmed.slice(idx + 1).trim().toLowerCase();
+    if (!rawExt || !lang) {
+      invalid.push(trimmed);
+      continue;
+    }
+    const ext = rawExt.startsWith(".") ? rawExt : `.${rawExt}`;
+    const canonical = LANGUAGE_TO_CANONICAL_EXT[lang];
+    if (!canonical) {
+      invalid.push(trimmed);
+      continue;
+    }
+    map.set(ext, canonical);
+  }
+  return { map, invalid };
+}
+
+const _extensionLanguageMap = parseExtensionLanguageMap(process.env.EXTENSION_LANGUAGE_MAP);
+
+/**
+ * Custom extension → canonical extension overrides from EXTENSION_LANGUAGE_MAP.
+ * Consulted by `getLanguageFromExtension`, `getAstGrepLang`, and the indexable
+ * checks so a mapped extension is treated as its target language end to end
+ * (label, AST chunking, symbols, call graph, discovery).
+ */
+export const EXTENSION_LANGUAGE_MAP = _extensionLanguageMap.map;
+
+/** Entries from EXTENSION_LANGUAGE_MAP that were rejected (warned at startup). */
+export const EXTENSION_LANGUAGE_MAP_INVALID = _extensionLanguageMap.invalid;
+
+/**
+ * Map a file extension to a language label. An EXTENSION_LANGUAGE_MAP override
+ * is resolved through the target language's canonical extension so the label
+ * matches what a native file of that language would get.
+ */
+export function getLanguageFromExtension(
+  ext: string,
+  override: Map<string, string> = EXTENSION_LANGUAGE_MAP,
+): string {
+  const target = override.get(ext) ?? ext;
+  return EXTENSION_TO_LANGUAGE[target] || "plaintext";
 }

@@ -33,7 +33,7 @@ import { writeSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { SOCRATICODE_VERSION } from "./constants.js";
+import { EXTENSION_LANGUAGE_MAP_INVALID, SOCRATICODE_VERSION } from "./constants.js";
 import { logger, setMcpLogSender } from "./services/logger.js";
 import { autoResumeIndexedProjects, gracefulShutdown } from "./services/startup.js";
 import { handleContextTool } from "./tools/context-tools.js";
@@ -471,6 +471,16 @@ server.tool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Surface any EXTENSION_LANGUAGE_MAP entries we had to drop (malformed, or a
+  // target language with no AST grammar) rather than silently ignoring them.
+  if (EXTENSION_LANGUAGE_MAP_INVALID.length > 0) {
+    logger.warn(
+      "EXTENSION_LANGUAGE_MAP: ignored invalid entries. Each must be `<ext>:<language>` " +
+      "with a language SocratiCode has an AST grammar for (e.g. .inc:php).",
+      { ignored: EXTENSION_LANGUAGE_MAP_INVALID },
+    );
+  }
 
   // Auto-resume watchers and incremental updates for already-indexed projects
   // Fire-and-forget — runs in background, non-blocking, non-fatal

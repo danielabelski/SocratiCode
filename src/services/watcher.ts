@@ -4,7 +4,7 @@ import path from "node:path";
 import type { AsyncSubscription, Event } from "@parcel/watcher";
 import watcher from "@parcel/watcher";
 import { collectionName, projectIdFromPath } from "../config.js";
-import { SPECIAL_FILES, SUPPORTED_EXTENSIONS } from "../constants.js";
+import { EXTENSION_LANGUAGE_MAP, SPECIAL_FILES, SUPPORTED_EXTENSIONS } from "../constants.js";
 import { invalidateGraphCache } from "./code-graph.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import { isIndexingInProgress, updateProjectIndex } from "./indexer.js";
@@ -38,7 +38,9 @@ function isIndexableFile(filePath: string): boolean {
   const fileName = path.basename(filePath);
   if (SPECIAL_FILES.has(fileName)) return true;
   const ext = path.extname(filePath).toLowerCase();
-  return SUPPORTED_EXTENSIONS.has(ext);
+  // EXTENSION_LANGUAGE_MAP extensions are real source files, so edits to them
+  // must trigger an incremental update like any other supported file.
+  return SUPPORTED_EXTENSIONS.has(ext) || EXTENSION_LANGUAGE_MAP.has(ext);
 }
 
 /**

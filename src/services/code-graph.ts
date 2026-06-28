@@ -6,7 +6,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { Lang, registerDynamicLanguage } from "@ast-grep/napi";
 import { graphCollectionName, projectIdFromPath } from "../config.js";
-import { EXTRA_EXTENSIONS, getLanguageFromExtension, MAX_GRAPH_FILE_BYTES, toForwardSlash } from "../constants.js";
+import { EXTENSION_LANGUAGE_MAP, EXTRA_EXTENSIONS, getLanguageFromExtension, MAX_GRAPH_FILE_BYTES, toForwardSlash } from "../constants.js";
 import type {
   CodeGraph, CodeGraphEdge, CodeGraphNode,
   SymbolEdge, SymbolGraphFilePayload, SymbolGraphMeta, SymbolNode, SymbolRef,
@@ -543,35 +543,47 @@ export function ensureDynamicLanguages(): void {
 // ── Language mapping for ast-grep ────────────────────────────────────────
 
 /** Map file extensions to ast-grep language identifiers */
-export function getAstGrepLang(ext: string): Lang | string | null {
-  const map: Record<string, Lang | string> = {
-    // Dynamic languages (string identifiers)
-    ".py": "python", ".pyw": "python", ".pyi": "python",
-    ".java": "java",
-    ".kt": "kotlin", ".kts": "kotlin",
-    ".scala": "scala",
-    ".c": "c", ".h": "c",
-    ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".hh": "cpp", ".cxx": "cpp",
-    ".cs": "csharp",
-    ".go": "go",
-    ".rs": "rust",
-    ".rb": "ruby",
-    ".php": "php",
-    ".swift": "swift",
-    ".dart": "dart",
-    ".lua": "lua",
-    ".sh": "bash", ".bash": "bash", ".zsh": "bash",
-    // Composite languages (parsed via HTML + script re-parse)
-    ".svelte": "svelte",
-    ".vue": "vue",
-    // Built-in languages (Lang enum)
-    ".js": Lang.JavaScript, ".jsx": Lang.JavaScript, ".mjs": Lang.JavaScript, ".cjs": Lang.JavaScript,
-    ".ts": Lang.TypeScript,
-    ".tsx": Lang.Tsx,
-    ".html": Lang.Html, ".htm": Lang.Html,
-    ".css": Lang.Css, ".scss": Lang.Css, ".sass": Lang.Css, ".less": Lang.Css, ".styl": Lang.Css,
-  };
-  return map[ext] ?? null;
+const EXTENSION_TO_AST_GREP_LANG: Record<string, Lang | string> = {
+  // Dynamic languages (string identifiers)
+  ".py": "python", ".pyw": "python", ".pyi": "python",
+  ".java": "java",
+  ".kt": "kotlin", ".kts": "kotlin",
+  ".scala": "scala",
+  ".c": "c", ".h": "c",
+  ".cpp": "cpp", ".hpp": "cpp", ".cc": "cpp", ".hh": "cpp", ".cxx": "cpp",
+  ".cs": "csharp",
+  ".go": "go",
+  ".rs": "rust",
+  ".rb": "ruby",
+  ".php": "php",
+  ".swift": "swift",
+  ".dart": "dart",
+  ".lua": "lua",
+  ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+  // Composite languages (parsed via HTML + script re-parse)
+  ".svelte": "svelte",
+  ".vue": "vue",
+  // Built-in languages (Lang enum)
+  ".js": Lang.JavaScript, ".jsx": Lang.JavaScript, ".mjs": Lang.JavaScript, ".cjs": Lang.JavaScript,
+  ".ts": Lang.TypeScript,
+  ".tsx": Lang.Tsx,
+  ".html": Lang.Html, ".htm": Lang.Html,
+  ".css": Lang.Css, ".scss": Lang.Css, ".sass": Lang.Css, ".less": Lang.Css, ".styl": Lang.Css,
+};
+
+/**
+ * Map a file extension to its ast-grep grammar (or null when none). An
+ * EXTENSION_LANGUAGE_MAP override is resolved through the target language's
+ * canonical extension, so a mapped extension (e.g. `.inc` → php) gets the same
+ * grammar a native file of that language would, keeping symbol extraction and
+ * AST chunking consistent with the language label.
+ */
+export function getAstGrepLang(
+  ext: string,
+  override: Map<string, string> = EXTENSION_LANGUAGE_MAP,
+): Lang | string | null {
+  const target = override.get(ext) ?? ext;
+  return EXTENSION_TO_AST_GREP_LANG[target] ?? null;
 }
 
 // ── Graph building ───────────────────────────────────────────────────────

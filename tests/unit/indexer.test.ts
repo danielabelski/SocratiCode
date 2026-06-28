@@ -4,8 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { CHUNK_SIZE, MAX_CHUNK_CHARS } from "../../src/constants.js";
-import { ensureDynamicLanguages } from "../../src/services/code-graph.js";
+import { CHUNK_SIZE, EXTENSION_LANGUAGE_MAP, MAX_CHUNK_CHARS } from "../../src/constants.js";
+import { ensureDynamicLanguages, getAstGrepLang } from "../../src/services/code-graph.js";
 import { chunkFileContent, chunkId, getIndexableFiles, hashContent, isIndexableFile } from "../../src/services/indexer.js";
 
 // Register dynamic language grammars once for AST-aware chunking tests
@@ -127,6 +127,19 @@ describe("indexer utilities", () => {
       expect(isIndexableFile("image.png", extras)).toBe(false);
     });
 
+    it("accepts extensions registered via EXTENSION_LANGUAGE_MAP", () => {
+      // isIndexableFile reads the global override map; mutate it directly
+      // (it is the same Map the function consults) and clean up after.
+      EXTENSION_LANGUAGE_MAP.set(".inc", ".php");
+      try {
+        expect(isIndexableFile("foo.class.inc")).toBe(true);
+      } finally {
+        EXTENSION_LANGUAGE_MAP.delete(".inc");
+      }
+      // Once removed, the extension is no longer indexable.
+      expect(isIndexableFile("foo.class.inc")).toBe(false);
+    });
+
     it("accepts .cfg and .ini extensions", () => {
       expect(isIndexableFile("config.cfg")).toBe(true);
       expect(isIndexableFile("settings.ini")).toBe(true);
@@ -136,6 +149,24 @@ describe("indexer utilities", () => {
       // path.extname preserves case but .toLowerCase() is applied
       expect(isIndexableFile("App.TS")).toBe(true);
       expect(isIndexableFile("Main.PY")).toBe(true);
+    });
+  });
+
+  // ── getAstGrepLang (EXTENSION_LANGUAGE_MAP override) ───────────
+
+  describe("getAstGrepLang override", () => {
+    it("resolves a mapped extension to the target language's grammar", () => {
+      const override = new Map([[".inc", ".php"]]);
+      expect(getAstGrepLang(".inc", override)).toBe("php");
+      // The vocabulary subtlety: a Lang-enum language resolves correctly too.
+      const tsOverride = new Map([[".component", ".ts"]]);
+      expect(String(getAstGrepLang(".component", tsOverride))).toBe("TypeScript");
+    });
+
+    it("returns null for an unmapped extension and leaves built-ins intact", () => {
+      const override = new Map([[".inc", ".php"]]);
+      expect(getAstGrepLang(".xyz", override)).toBeNull();
+      expect(getAstGrepLang(".php", override)).toBe("php");
     });
   });
 
