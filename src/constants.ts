@@ -390,6 +390,10 @@ export function getLanguageFromExtension(
   ext: string,
   override: Map<string, string> = EXTENSION_LANGUAGE_MAP,
 ): string {
-  const target = override.get(ext) ?? ext;
+  // Normalize so a caller passing an uppercase ext still matches the
+  // (lowercased) override keys; the only case-sensitive built-in key, `.R`,
+  // collapses to `.r` with the same value, so this changes nothing else.
+  const normalized = ext.toLowerCase();
+  const target = override.get(normalized) ?? normalized;
   return EXTENSION_TO_LANGUAGE[target] || "plaintext";
 }

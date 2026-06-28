@@ -582,7 +582,10 @@ export function getAstGrepLang(
   ext: string,
   override: Map<string, string> = EXTENSION_LANGUAGE_MAP,
 ): Lang | string | null {
-  const target = override.get(ext) ?? ext;
+  // Match getLanguageFromExtension: normalize casing so override lookups (keys
+  // are stored lowercased) and the grammar stay aligned with the label.
+  const normalized = ext.toLowerCase();
+  const target = override.get(normalized) ?? normalized;
   return EXTENSION_TO_AST_GREP_LANG[target] ?? null;
 }
 

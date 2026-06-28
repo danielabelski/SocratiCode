@@ -323,6 +323,8 @@ describe("constants", () => {
     it("resolves an EXTENSION_LANGUAGE_MAP override to the target language label", () => {
       const override = new Map([[".inc", ".php"]]);
       expect(getLanguageFromExtension(".inc", override)).toBe("php");
+      // Case-insensitive: an uppercase ext still matches the lowercased key.
+      expect(getLanguageFromExtension(".INC", override)).toBe("php");
       // Unmapped extensions are unaffected by the override.
       expect(getLanguageFromExtension(".xyz", override)).toBe("plaintext");
     });

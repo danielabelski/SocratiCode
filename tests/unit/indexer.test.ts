@@ -128,16 +128,21 @@ describe("indexer utilities", () => {
     });
 
     it("accepts extensions registered via EXTENSION_LANGUAGE_MAP", () => {
-      // isIndexableFile reads the global override map; mutate it directly
-      // (it is the same Map the function consults) and clean up after.
+      // isIndexableFile reads the global override map; mutate it directly (it is
+      // the same Map the function consults) and restore the prior state after,
+      // so the test stays hermetic even if `.inc` is ever pre-configured.
+      const baseline = isIndexableFile("foo.class.inc");
+      const hadPrevious = EXTENSION_LANGUAGE_MAP.has(".inc");
+      const previous = EXTENSION_LANGUAGE_MAP.get(".inc");
       EXTENSION_LANGUAGE_MAP.set(".inc", ".php");
       try {
         expect(isIndexableFile("foo.class.inc")).toBe(true);
       } finally {
-        EXTENSION_LANGUAGE_MAP.delete(".inc");
+        if (hadPrevious) EXTENSION_LANGUAGE_MAP.set(".inc", previous as string);
+        else EXTENSION_LANGUAGE_MAP.delete(".inc");
       }
-      // Once removed, the extension is no longer indexable.
-      expect(isIndexableFile("foo.class.inc")).toBe(false);
+      // Restored to the pre-test baseline.
+      expect(isIndexableFile("foo.class.inc")).toBe(baseline);
     });
 
     it("accepts .cfg and .ini extensions", () => {
@@ -158,6 +163,8 @@ describe("indexer utilities", () => {
     it("resolves a mapped extension to the target language's grammar", () => {
       const override = new Map([[".inc", ".php"]]);
       expect(getAstGrepLang(".inc", override)).toBe("php");
+      // Case-insensitive, matching getLanguageFromExtension.
+      expect(getAstGrepLang(".INC", override)).toBe("php");
       // The vocabulary subtlety: a Lang-enum language resolves correctly too.
       const tsOverride = new Map([[".component", ".ts"]]);
       expect(String(getAstGrepLang(".component", tsOverride))).toBe("TypeScript");
