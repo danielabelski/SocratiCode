@@ -10,10 +10,13 @@ import { collectionName, projectIdFromPath } from "../config.js";
 import {
   CHUNK_OVERLAP,
   CHUNK_SIZE,
+  DETECT_HEAD_BYTES,
+  detectExtensionlessExtension,
   EXTENSION_LANGUAGE_MAP,
   EXTRA_EXTENSIONS,
   getLanguageFromExtension,
   INDEX_BATCH_SIZE,
+  indexExtensionlessEnabled,
   MAX_AVG_LINE_LENGTH,
   MAX_CHUNK_CHARS,MAX_FILE_BYTES,
   SPECIAL_FILES,
@@ -23,6 +26,7 @@ import type { FileChunk } from "../types.js";
 import { ensureDynamicLanguages, getAstGrepLang, rebuildGraph, removeGraph } from "./code-graph.js";
 import { ensureArtifactsIndexed, loadConfig, removeAllArtifacts } from "./context-artifacts.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
+import { resolveExtensionlessExtension } from "./extensionless.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import { acquireProjectLock, releaseProjectLock } from "./lock.js";
 import { logger } from "./logger.js";
@@ -40,7 +44,7 @@ import {
 import { updateChangedFilesSymbolGraph } from "./symbol-graph-incremental.js";
 import { loadSymbolGraphMeta } from "./symbol-graph-store.js";
 
-const FILE_SCAN_BATCH = 50; // Number of files to scan/chunk in parallel (I/O only, no network)
+export const FILE_SCAN_BATCH = 50; // Number of files to scan/chunk in parallel (I/O only, no network)
 
 /**
  * Phase F: maximum number of changed/removed files for which the watcher path
@@ -432,7 +436,26 @@ export function chunkFileContent(
   content: string,
 ): FileChunk[] {
   const lines = content.split("\n");
-  const ext = path.extname(filePath).toLowerCase();
+  let ext = path.extname(filePath).toLowerCase();
+  // Extensionless files (not SPECIAL_FILES) inherit their language/grammar from
+  // content detection, gated by the same kill-switch as discovery so the two
+  // stay consistent. The on-disk path is never rewritten — only the
+  // language/grammar selection changes.
+  if (ext === "" && indexExtensionlessEnabled() && !SPECIAL_FILES.has(path.basename(filePath))) {
+    // Detect on the same byte window as discovery's readFileHead. `content` is
+    // a decoded string, so slice counts UTF-16 units, not bytes; take the first
+    // DETECT_HEAD_BYTES chars (which encode to >= that many bytes) and truncate
+    // to DETECT_HEAD_BYTES bytes so both paths inspect an identical head.
+    const head = Buffer.from(content.slice(0, DETECT_HEAD_BYTES), "utf-8")
+      .subarray(0, DETECT_HEAD_BYTES)
+      .toString("utf-8");
+    const detected = detectExtensionlessExtension(head);
+    // If the content changed since discovery admitted this file (TOCTOU) and it
+    // no longer detects as code, produce no chunks rather than indexing it as
+    // plaintext — keeping chunking consistent with getIndexableFiles' contract.
+    if (!detected) return [];
+    ext = detected;
+  }
   const language = getLanguageFromExtension(ext);
 
   // Detect minified/bundled content before any other branching: a high
@@ -638,12 +661,37 @@ export async function getIndexableFiles(
     absolute: false,
   });
 
-  return allFiles.filter((relativePath) => {
+  const kept: string[] = [];
+  const extensionlessCandidates: string[] = [];
+  const detectionEnabled = indexExtensionlessEnabled();
+
+  for (const relativePath of allFiles) {
+    if (shouldIgnore(ig, relativePath)) continue;
     const fileName = path.basename(relativePath);
-    if (!isIndexableFile(fileName, extraExts)) return false;
-    if (shouldIgnore(ig, relativePath)) return false;
-    return true;
-  });
+    if (isIndexableFile(fileName, extraExts)) {
+      kept.push(relativePath);
+      continue;
+    }
+    // Extensionless survivors (detection never runs on a file with an
+    // extension, and SPECIAL_FILES were already admitted above).
+    if (detectionEnabled && path.extname(fileName) === "") {
+      extensionlessCandidates.push(relativePath);
+    }
+  }
+
+  // Batched head-read + content detection for extensionless candidates.
+  for (let i = 0; i < extensionlessCandidates.length; i += FILE_SCAN_BATCH) {
+    const batch = extensionlessCandidates.slice(i, i + FILE_SCAN_BATCH);
+    const detected = await Promise.all(
+      batch.map(async (relativePath) => {
+        const ext = await resolveExtensionlessExtension(path.join(projectPath, relativePath));
+        return ext ? relativePath : null;
+      }),
+    );
+    for (const r of detected) if (r) kept.push(r);
+  }
+
+  return kept;
 }
 
 /** Full index of a project directory */

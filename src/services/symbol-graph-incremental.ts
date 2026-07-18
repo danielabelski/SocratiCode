@@ -33,6 +33,7 @@ import type {
   SymbolRef,
 } from "../types.js";
 import { getAstGrepLang } from "./code-graph.js";
+import { resolveExtensionlessExtensionStrict } from "./extensionless.js";
 import { resolveCallSites } from "./graph-symbol-resolution.js";
 import {
   extractSymbolsAndCalls,
@@ -137,9 +138,60 @@ export async function updateChangedFilesSymbolGraph(
 
   // ── Process changed files (re-extract + diff + upsert) ────────────────
   for (const relPath of changedRelPaths) {
-    const ext = path.extname(relPath);
-    const lang = getAstGrepLang(ext);
-    if (!lang) continue;
+    let ext = path.extname(relPath);
+    let lang = getAstGrepLang(ext);
+    const wasExtensionless = ext === "";
+    // Detected extensionless files must patch incrementally too, or their
+    // symbols would appear only after a full rebuildGraph() and go stale
+    // between full rebuilds. Grammar-bearing only — `.txt` stays out.
+    if (!lang && wasExtensionless) {
+      // Distinguish "readable but not code" (→ purge stale symbols below) from a
+      // read/stat failure. The lenient resolver collapses both to null, which
+      // would purge a still-valid payload on a transient I/O blip — and only for
+      // extensionless files (an extensioned file keeps its payload via the
+      // readFile catch below). Use the strict variant so a failure surfaces, and
+      // skip without purging, mirroring the extensioned path.
+      let detected: string | null;
+      try {
+        detected = await resolveExtensionlessExtensionStrict(path.join(projectPath, relPath));
+      } catch (err) {
+        // ENOENT (deleted between change-detection and read) is an expected skip —
+        // a real delete is reconciled via removedRelPaths. Any other fault
+        // (EACCES/EIO) means we are keeping a now-stale payload for a changed file
+        // we could not read; surface it at debug, matching the lenient resolver's
+        // non-ENOENT log, rather than swallowing it silently.
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+          logger.debug("Could not read changed extensionless file; keeping prior symbols (skipping)", {
+            relPath,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        continue;
+      }
+      if (detected) {
+        ext = detected;
+        lang = getAstGrepLang(detected);
+      }
+    }
+    if (!lang) {
+      // A *changed* extensionless file that lost its grammar (e.g. its shebang
+      // changed to an unmapped interpreter, so it now detects as .txt) is still
+      // indexable, so it arrives here as changed — never via removedRelPaths.
+      // Drop any prior symbol payload so the incremental graph converges to the
+      // same set as a full rebuild (which excludes grammar-less extensionless
+      // files) rather than leaving phantom symbols behind.
+      if (wasExtensionless) {
+        const oldPayload = await loadFilePayload(projectId, relPath);
+        if (oldPayload) {
+          await applyRemoval(projectId, oldPayload, getNameShard, getReverseShard);
+          await deleteFilePayload(projectId, relPath);
+          symbolsDelta -= countNamedSymbols(oldPayload.symbols);
+          edgesDelta -= oldPayload.outgoingCalls.length;
+          filesRemovedActual++;
+        }
+      }
+      continue;
+    }
     let source: string;
     try {
       source = await fs.readFile(path.join(projectPath, relPath), "utf-8");

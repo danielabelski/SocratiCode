@@ -397,3 +397,158 @@ export function getLanguageFromExtension(
   const target = override.get(normalized) ?? normalized;
   return EXTENSION_TO_LANGUAGE[target] || "plaintext";
 }
+
+// ── Extensionless file detection ──────────────────────────────────────────
+
+/**
+ * Bytes of file head inspected for extensionless language detection. Shared by
+ * the discovery head-read (`readFileHead`) and the chunk-time re-detection so
+ * the two paths always look at the same window and agree on the language.
+ */
+export const DETECT_HEAD_BYTES = 8192;
+
+/**
+ * Whether content-based detection of extensionless files is enabled.
+ * Default ON (strictly additive — only adds files, never removes). `INDEX_EXTENSIONLESS=false` or `=0`
+ * restores the pre-detection behavior (extensionless files are never indexed
+ * unless their exact name is in {@link SPECIAL_FILES}). Read lazily so a mixed
+ * fleet reads one value per scan and tests can toggle it via `vi.stubEnv`.
+ */
+export function indexExtensionlessEnabled(): boolean {
+  const v = (process.env.INDEX_EXTENSIONLESS ?? "").trim().toLowerCase();
+  return v !== "false" && v !== "0";
+}
+
+/** Shebang interpreter basename → canonical extension (Stage 1). */
+const INTERPRETER_TO_EXT: Record<string, string> = {
+  sh: ".sh", bash: ".sh", zsh: ".sh", dash: ".sh", ksh: ".sh", ash: ".sh",
+  python: ".py",
+  node: ".js", nodejs: ".js",
+  ruby: ".rb",
+  php: ".php",
+  lua: ".lua",
+};
+
+/** Interpreter-position wrappers whose real interpreter is a later token. */
+const SHEBANG_WRAPPERS = new Set(["env", "with-contenv", "nice", "sudo", "doas", "time"]);
+
+/**
+ * Per-wrapper flags that consume the following token as their argument.
+ * Wrapper-specific because the same flag differs by tool: `nice -n <prio>`
+ * consumes an argument, but `sudo -n` (non-interactive) is boolean — a global
+ * set would let `sudo -n python3` swallow the interpreter.
+ */
+const WRAPPER_ARG_FLAGS: Record<string, Set<string>> = {
+  nice: new Set(["-n"]),
+  sudo: new Set(["-u"]),
+  doas: new Set(["-u"]),
+  env: new Set(["-u"]),
+};
+
+/** Content-sniff pattern tables (Stage 2); most patterns are multiline-anchored
+ *  (the trailing shell parameter-expansion pattern is a deliberate substring match). */
+const PYTHON_PATTERNS: RegExp[] = [
+  /^from\s+\.*(?:[A-Za-z_][\w.]*)?\s+import\s/m,
+  /^import\s+[A-Za-z_][\w.]*(?:\s*,\s*[A-Za-z_][\w.]*)*\s*$/m,
+  /^\s*def\s+\w+\s*\([^)]*\)\s*(?:->[^:]+)?:/m,
+  /^\s*class\s+\w+(?:\([^)]*\))?\s*:/m,
+];
+const SHELL_PATTERNS: RegExp[] = [
+  /^\s*set\s+-[euxo]/m,
+  /^\s*if\s+\[\[?\s.*\]\]?\s*;\s*then\b/m,
+  /^\s*(?:fi|esac|done)\s*$/m,
+  /^\s*function\s+\w+/m,
+  /^\s*\w+\s*\(\)\s*\{/m,
+  /\$\{?\d|\$\{[A-Za-z_]/,
+];
+
+/** POSIX/Windows-safe basename for a shebang interpreter path. */
+function shebangBasename(p: string): string {
+  const parts = p.split(/[/\\]/);
+  return parts[parts.length - 1];
+}
+
+/**
+ * Map an interpreter basename to a canonical ext (with version normalization).
+ * Any shebang with an unmapped interpreter still yields `.txt` (a declared
+ * script indexed as searchable plaintext).
+ */
+function interpreterToExt(interpreter: string): string {
+  const exact = INTERPRETER_TO_EXT[interpreter];
+  if (exact) return exact;
+  // Version normalization: strip a trailing [\d.]+ run plus any CPython
+  // ABI-flag suffix — d (debug), m (pymalloc), u (wide-unicode) — so
+  // python3.6 → python and python3.7dm → python. Never reduce to empty (a
+  // stray numeric arg is not an interpreter).
+  const stripped = interpreter.replace(/[\d.]+[dmu]*$/, "");
+  if (stripped && stripped !== interpreter) {
+    const mapped = INTERPRETER_TO_EXT[stripped];
+    if (mapped) return mapped;
+  }
+  return ".txt";
+}
+
+/** Resolve a shebang line (the whole first line, incl. `#!`) to a canonical ext. */
+function detectFromShebang(firstLine: string): string {
+  const tokens = firstLine.slice(2).trim().split(/\s+/).filter((t) => t.length > 0);
+  let candidate = tokens.length > 0 ? shebangBasename(tokens[0]) : "";
+  let i = 1;
+
+  while (SHEBANG_WRAPPERS.has(candidate)) {
+    const argFlags = WRAPPER_ARG_FLAGS[candidate];
+    let next = "";
+    while (i < tokens.length) {
+      const tok = tokens[i];
+      if (tok.startsWith("-")) {
+        i += argFlags?.has(tok) ? 2 : 1; // consume flag (+ its arg for this wrapper)
+        continue;
+      }
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) {
+        i += 1; // VAR=value environment assignment
+        continue;
+      }
+      next = shebangBasename(tok);
+      i += 1;
+      break;
+    }
+    if (!next) return ".txt"; // ran out of tokens — declared script, no interpreter
+    candidate = next;
+  }
+  return interpreterToExt(candidate);
+}
+
+/** Score a language's pattern table: count of distinct patterns that match. */
+function countPatternHits(patterns: RegExp[], text: string): number {
+  let n = 0;
+  for (const re of patterns) if (re.test(text)) n++;
+  return n;
+}
+
+/**
+ * Detect a canonical file extension for an extensionless file from the first
+ * ~8 KiB of its content. Returns `.sh`, `.py`, `.js`, `.rb`, `.php`, `.lua`,
+ * `.txt`, or `null` (not indexable code). PURE — no I/O.
+ *
+ * A NUL byte (0x00) survives UTF-8/latin1 decoding as U+0000, so the Stage-0
+ * binary guard on the decoded string is equivalent to a raw-byte check and
+ * also rejects UTF-16 (its interleaved NUL bytes).
+ */
+export function detectExtensionlessExtension(contentHead: string): string | null {
+  // Stage 0 — binary guard (rejects binaries and UTF-16).
+  if (contentHead.includes("\u0000")) return null;
+
+  // Stage 1 — shebang.
+  if (contentHead.startsWith("#!")) {
+    const firstLine = contentHead.split("\n", 1)[0];
+    return detectFromShebang(firstLine);
+  }
+
+  // Stage 2 — content sniff. Score both languages, then decide by precedence:
+  // Compute both counts before deciding, since the Python test compares
+  // pyHits against shHits (so the decision is not per-language-independent).
+  const pyHits = countPatternHits(PYTHON_PATTERNS, contentHead);
+  const shHits = countPatternHits(SHELL_PATTERNS, contentHead);
+  if (pyHits >= 1 && pyHits >= shHits) return ".py";
+  if (shHits >= 2) return ".sh";
+  return null;
+}

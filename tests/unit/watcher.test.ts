@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -36,6 +39,7 @@ vi.mock("../../src/services/ignore.js", () => ({
 const mockUpdateProjectIndex = vi.fn(async (_path: string, _progress?: unknown) => ({ added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false }));
 const mockIsIndexingInProgress = vi.fn((_path: string) => false);
 vi.mock("../../src/services/indexer.js", () => ({
+  FILE_SCAN_BATCH: 50,
   updateProjectIndex: (...args: unknown[]) => mockUpdateProjectIndex(...(args as [string, unknown])),
   isIndexingInProgress: (...args: unknown[]) => mockIsIndexingInProgress(...(args as [string])),
 }));
@@ -74,6 +78,7 @@ import {
   clearExternalWatchCache,
   ensureWatcherStarted,
   getWatchedProjects,
+  isIndexableFile,
   isWatchedByAnyProcess,
   isWatching,
   startWatching,
@@ -330,6 +335,71 @@ describe("watcher (unit)", () => {
 
       expect(mockUpdateProjectIndex).toHaveBeenCalled();
       vi.useRealTimers();
+    });
+
+    it("triggers update for a detected extensionless file event (async filter)", async () => {
+      // Exercises the async event pipeline end-to-end (not just isIndexableFile
+      // in isolation): a real extensionless bash probe fired as a watch event
+      // must flow through the async filter to scheduleUpdate. Uses real timers +
+      // waitFor rather than fake timers, since the filter does a real head-read
+      // and fake-timer/real-I/O mixing races.
+      fs.mkdirSync(RESOLVED_PROJECT, { recursive: true });
+      const probe = path.join(RESOLVED_PROJECT, "strato-check-evt");
+      fs.writeFileSync(probe, "#!/bin/bash\nexit 0\n");
+      try {
+        await startWatching(TEST_PROJECT);
+        mockSubscribeCallback?.(null, [{ path: probe, type: "update" }]);
+        await vi.waitFor(() => expect(mockUpdateProjectIndex).toHaveBeenCalled(), {
+          timeout: 5000,
+          interval: 50,
+        });
+      } finally {
+        fs.rmSync(probe, { force: true });
+      }
+    });
+
+    it("schedules a reconcile for an extensionless update event even when it no longer detects as code", async () => {
+      // A previously-indexed extensionless file edited into readable non-code
+      // still needs updateProjectIndex so its stale chunks/symbols are purged,
+      // even though isIndexableFile now returns false for it.
+      fs.mkdirSync(RESOLVED_PROJECT, { recursive: true });
+      const stale = path.join(RESOLVED_PROJECT, "was-a-probe");
+      fs.writeFileSync(stale, "Release notes: nothing here is code.\n");
+      try {
+        await startWatching(TEST_PROJECT);
+        mockSubscribeCallback?.(null, [{ path: stale, type: "update" }]);
+        await vi.waitFor(() => expect(mockUpdateProjectIndex).toHaveBeenCalled(), {
+          timeout: 5000,
+          interval: 50,
+        });
+      } finally {
+        fs.rmSync(stale, { force: true });
+      }
+    });
+
+    it("logs and does not crash if event filtering throws (crash-guard)", async () => {
+      vi.useFakeTimers();
+      try {
+        // Force the filter to reject; the async callback's promise is ignored by
+        // @parcel/watcher, so an unguarded rejection would crash the process.
+        vi.mocked(shouldIgnore).mockImplementationOnce(() => {
+          throw new Error("boom");
+        });
+        await startWatching(TEST_PROJECT);
+
+        mockSubscribeCallback?.(null, [{ path: path.join(RESOLVED_PROJECT, "src/app.ts"), type: "update" }]);
+        await vi.advanceTimersByTimeAsync(2100);
+
+        expect(logger.error).toHaveBeenCalledWith(
+          "Watch event filtering failed",
+          expect.objectContaining({ error: "boom" }),
+        );
+        expect(mockUpdateProjectIndex).not.toHaveBeenCalled();
+      } finally {
+        // Restore real timers even if an assertion above throws, so leaked fake
+        // timers can't cascade into unrelated tests.
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -659,5 +729,82 @@ describe("watcher (unit)", () => {
       expect(isWatching(TEST_PROJECT)).toBe(true);
       vi.useRealTimers();
     });
+  });
+});
+
+describe("watcher isIndexableFile — extensionless", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-watch-extless-"));
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  it("treats a detected extensionless script as indexable", async () => {
+    const p = path.join(dir, "strato-check-x");
+    fs.writeFileSync(p, "#!/bin/bash\nexit 0\n");
+    expect(await isIndexableFile(p)).toBe(true);
+  });
+
+  it("ignores a readable non-code extensionless file", async () => {
+    const p = path.join(dir, "LICENSE");
+    fs.writeFileSync(p, "MIT License\n\nCopyright (c) 2026\n");
+    expect(await isIndexableFile(p)).toBe(false);
+  });
+
+  it("schedules (returns true) for a vanished extensionless file, to reconcile a delete", async () => {
+    expect(await isIndexableFile(path.join(dir, "was-deleted"))).toBe(true);
+  });
+
+  it("ignores an extensionless directory (never head-reads it)", async () => {
+    const d = path.join(dir, "somedir");
+    fs.mkdirSync(d);
+    expect(await isIndexableFile(d)).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")("ignores an extensionless FIFO without blocking on the open", async () => {
+    // A FIFO reaches this guard like a directory does, but opening it for read
+    // blocks until a writer appears — so the guard must lstat and drop it rather
+    // than head-read it inside the long-lived watch callback (a directory throws
+    // EISDIR; a FIFO would hang and starve the I/O threadpool).
+    const fifo = path.join(dir, "evt-pipe");
+    execFileSync("mkfifo", [fifo]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        isIndexableFile(fifo),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("blocked on FIFO open")), 2000);
+        }),
+      ]);
+      expect(result).toBe(false);
+    } finally {
+      clearTimeout(timer);
+      // Release any read-open a buggy guard left blocked so the leaked threadpool
+      // op does not stall worker teardown.
+      try {
+        fs.closeSync(fs.openSync(fifo, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK));
+      } catch {
+        /* no blocked reader (guard worked) → ENXIO; ignore */
+      }
+    }
+  });
+
+  it("keeps supported extensions indexable without a read", async () => {
+    expect(await isIndexableFile(path.join(dir, "a.ts"))).toBe(true);
+  });
+
+  it("respects the kill-switch for extensionless files", async () => {
+    const p = path.join(dir, "probe");
+    fs.writeFileSync(p, "#!/bin/bash\n");
+    vi.stubEnv("INDEX_EXTENSIONLESS", "false");
+    expect(await isIndexableFile(p)).toBe(false);
   });
 });

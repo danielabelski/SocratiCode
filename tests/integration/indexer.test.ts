@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
+import fs from "node:fs";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { collectionName, projectIdFromPath } from "../../src/config.js";
@@ -21,6 +22,7 @@ import {
   createFixtureProject,
   type FixtureProject,
   isDockerAvailable,
+  modifyFixtureFile,
   removeFixtureFile,
 } from "../helpers/fixtures.js";
 import { cleanupTestCollections, waitForOllama, waitForQdrant } from "../helpers/setup.js";
@@ -256,4 +258,157 @@ export function handleWebhook(payload: unknown): { status: string } {
       expect(info).toBeNull();
     });
   });
+});
+
+describe.skipIf(!dockerAvailable)("indexer service — extensionless files", () => {
+  let extFixture: FixtureProject;
+  let extCollection: string;
+
+  beforeAll(async () => {
+    await ensureQdrantReady();
+    await ensureOllamaReady();
+    await waitForQdrant();
+    await waitForOllama();
+
+    extFixture = createFixtureProject("indexer-extless-test");
+    // Bash health probe (shebang → .sh).
+    addFileToFixture(
+      extFixture.root,
+      "bin/strato-check-x",
+      "#!/bin/bash\n# extlesscheck liveness probe\ncurl -sf http://localhost:8080/healthz || exit 1\n",
+    );
+    // No-shebang Python (waf wscript sniff → .py).
+    addFileToFixture(
+      extFixture.root,
+      "waf-build",
+      "def configure(conf):\n    conf.load('extlesswaf_compiler')\n\ndef build(bld):\n    bld.program(source='main.c', target='extlesswaf_app')\n",
+    );
+    // Perl shebang (unmapped interpreter → .txt — indexed as plaintext).
+    addFileToFixture(
+      extFixture.root,
+      "run-legacy",
+      "#!/usr/bin/perl\nprint \"extlessperl legacy tool running\\n\";\n",
+    );
+    // Non-code prose (no shebang, no sniff → not indexed).
+    addFileToFixture(extFixture.root, "LICENSE", "MIT License\n\nCopyright (c) 2026 Example Org\n");
+    // Extensionless binary (NUL byte → rejected by the binary guard).
+    fs.writeFileSync(path.join(extFixture.root, "blob"), Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x01, 0x02]));
+    // PHP shebang (distinct grammar → graph-eligible) — a non-.sh/.py language
+    // driven end to end past the detector.
+    addFileToFixture(
+      extFixture.root,
+      "php-report",
+      "#!/usr/bin/php\n<?php\n// extlessphp report generator\necho \"report done\\n\";\n",
+    );
+
+    extCollection = collectionName(projectIdFromPath(extFixture.root));
+    await indexProject(extFixture.root);
+  }, 180_000);
+
+  afterAll(async () => {
+    try {
+      await removeProjectIndex(extFixture.root);
+    } catch {
+      /* ignore */
+    }
+    extFixture.cleanup();
+    await cleanupTestCollections(extFixture.root);
+  });
+
+  it("discovers detected extensionless scripts, skips non-code and binary", async () => {
+    const files = await getIndexableFiles(extFixture.root);
+    expect(files).toContain("bin/strato-check-x");
+    expect(files).toContain("waf-build");
+    expect(files).toContain("run-legacy"); // perl → .txt — still indexed as plaintext
+    expect(files).not.toContain("LICENSE");
+    expect(files).not.toContain("blob");
+  });
+
+  it("indexes the bash probe as shell with its true on-disk path (identity preserved)", async () => {
+    const results = await searchChunks(extCollection, "extlesscheck liveness probe curl healthz", 10);
+    const hit = results.find((r) => r.relativePath === "bin/strato-check-x");
+    expect(hit).toBeDefined();
+    expect(hit?.language).toBe("shell");
+  });
+
+  it("indexes a php-shebang file as php (distinct-grammar language end to end)", async () => {
+    const results = await searchChunks(extCollection, "extlessphp report generator", 10);
+    const hit = results.find((r) => r.relativePath === "php-report");
+    expect(hit).toBeDefined();
+    expect(hit?.language).toBe("php");
+  });
+
+  it("indexes the no-shebang Python waf file as python", async () => {
+    const results = await searchChunks(extCollection, "waf configure build compiler program extlesswaf", 10);
+    const hit = results.find((r) => r.relativePath === "waf-build");
+    expect(hit).toBeDefined();
+    expect(hit?.language).toBe("python");
+  });
+
+  it("indexes a perl shebang as searchable plaintext (unmapped interpreter)", async () => {
+    const results = await searchChunks(extCollection, "extlessperl legacy tool running", 10);
+    const hit = results.find((r) => r.relativePath === "run-legacy");
+    expect(hit).toBeDefined();
+    expect(hit?.language).toBe("plaintext");
+  });
+
+  it("rename symmetry: gaining a .sh extension moves the chunks to the new path", async () => {
+    const rf = createFixtureProject("indexer-rename-test");
+    const rfCollection = collectionName(projectIdFromPath(rf.root));
+    try {
+      addFileToFixture(rf.root, "bin/probe", "#!/bin/bash\necho extlessrename_marker_zzz\n");
+      await indexProject(rf.root);
+
+      let results = await searchChunks(rfCollection, "extlessrename_marker_zzz", 10);
+      expect(results.find((r) => r.relativePath === "bin/probe")).toBeDefined();
+
+      // Rename: the same content now carries a real extension.
+      removeFixtureFile(rf.root, "bin/probe");
+      addFileToFixture(rf.root, "bin/probe.sh", "#!/bin/bash\necho extlessrename_marker_zzz\n");
+      await updateProjectIndex(rf.root);
+
+      results = await searchChunks(rfCollection, "extlessrename_marker_zzz", 10);
+      expect(results.find((r) => r.relativePath === "bin/probe.sh")).toBeDefined();
+      // The old extensionless path's chunks were deleted.
+      expect(results.find((r) => r.relativePath === "bin/probe")).toBeUndefined();
+    } finally {
+      try {
+        await removeProjectIndex(rf.root);
+      } catch {
+        /* ignore */
+      }
+      rf.cleanup();
+      await cleanupTestCollections(rf.root);
+    }
+  }, 180_000);
+
+  it("purges chunks when an extensionless file's content flips from code to non-code", async () => {
+    // The file keeps its name but stops being indexable (shebang removed). The
+    // next update must drop its stale chunks — the scenario the incremental
+    // add/delete symmetry exists to prevent.
+    const cf = createFixtureProject("indexer-contentflip-test");
+    const cfCollection = collectionName(projectIdFromPath(cf.root));
+    try {
+      addFileToFixture(cf.root, "svc/gen", "#!/bin/bash\necho contentflip_marker_qqq\n");
+      await indexProject(cf.root);
+
+      let results = await searchChunks(cfCollection, "contentflip_marker_qqq", 10);
+      expect(results.find((r) => r.relativePath === "svc/gen")).toBeDefined();
+
+      // Content flips to non-code (no shebang, no sniff) → no longer indexable.
+      modifyFixtureFile(cf.root, "svc/gen", "All rights reserved.\nThis file is now plain prose.\n");
+      await updateProjectIndex(cf.root);
+
+      results = await searchChunks(cfCollection, "contentflip_marker_qqq", 10);
+      expect(results.find((r) => r.relativePath === "svc/gen")).toBeUndefined();
+    } finally {
+      try {
+        await removeProjectIndex(cf.root);
+      } catch {
+        /* ignore */
+      }
+      cf.cleanup();
+      await cleanupTestCollections(cf.root);
+    }
+  }, 180_000);
 });
