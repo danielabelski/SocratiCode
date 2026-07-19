@@ -1,13 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
+import fsp from "node:fs/promises";
 import path from "node:path";
 import type { AsyncSubscription, Event } from "@parcel/watcher";
 import watcher from "@parcel/watcher";
 import { collectionName, projectIdFromPath } from "../config.js";
-import { EXTENSION_LANGUAGE_MAP, SPECIAL_FILES, SUPPORTED_EXTENSIONS } from "../constants.js";
+import {
+  detectExtensionlessExtension,
+  EXTENSION_LANGUAGE_MAP,
+  indexExtensionlessEnabled,
+  SPECIAL_FILES,
+  SUPPORTED_EXTENSIONS,
+} from "../constants.js";
 import { invalidateGraphCache } from "./code-graph.js";
+import { readFileHead } from "./extensionless.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
-import { isIndexingInProgress, updateProjectIndex } from "./indexer.js";
+import { FILE_SCAN_BATCH, isIndexingInProgress, updateProjectIndex } from "./indexer.js";
 import { acquireProjectLock, isProjectLocked, releaseProjectLock } from "./lock.js";
 import { logger } from "./logger.js";
 import { getCollectionInfo, getProjectMetadata } from "./qdrant.js";
@@ -34,13 +42,56 @@ const externalWatchCache = new Map<string, number>();
 /** How long to cache the "another process is watching" result before rechecking */
 const EXTERNAL_WATCH_CACHE_TTL_MS = 60_000;
 
-function isIndexableFile(filePath: string): boolean {
+/**
+ * Whether a watched path should trigger an incremental index. Returns `true` for
+ * supported/mapped extensions and `SPECIAL_FILES` by name; for an extensionless
+ * regular file it consults content detection (kill-switch-gated). A vanished or
+ * unreadable path returns `true` so the change is still reconciled, while a
+ * directory/FIFO/other non-regular file returns `false` (never head-read).
+ */
+export async function isIndexableFile(filePath: string): Promise<boolean> {
   const fileName = path.basename(filePath);
   if (SPECIAL_FILES.has(fileName)) return true;
   const ext = path.extname(filePath).toLowerCase();
   // EXTENSION_LANGUAGE_MAP extensions are real source files, so edits to them
   // must trigger an incremental update like any other supported file.
-  return SUPPORTED_EXTENSIONS.has(ext) || EXTENSION_LANGUAGE_MAP.has(ext);
+  if (SUPPORTED_EXTENSIONS.has(ext) || EXTENSION_LANGUAGE_MAP.has(ext)) return true;
+  if (ext !== "" || !indexExtensionlessEnabled()) return false;
+  // Extensionless: only a regular file can be a code file. @parcel/watcher also
+  // emits events for directories/FIFOs/sockets, which must NOT be head-read — a
+  // directory read throws EISDIR and a FIFO open blocks — so lstat and drop
+  // them. A vanished path (ENOENT) or an unstattable one is a change we still
+  // schedule so updateProjectIndex reconciles it.
+  let stats: import("node:fs").Stats;
+  try {
+    stats = await fsp.lstat(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      logger.debug("Extensionless watch check could not stat file (scheduling update)", {
+        filePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return true;
+  }
+  if (!stats.isFile()) return false; // directory / FIFO / socket — never a code file
+  // Readable regular file: schedule when it looks like code, or when it can no
+  // longer be read (reconcile). NOTE: a file previously indexed as code that is
+  // edited into readable non-code (detection → null) returns false here, so a
+  // watch-only reconcile of *that* edit is deferred to the next
+  // updateProjectIndex (any other change / nightly / manual codebase_update) —
+  // a bounded, self-healing gap.
+  try {
+    return detectExtensionlessExtension(await readFileHead(filePath)) !== null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      logger.debug("Extensionless watch check could not read file (scheduling update)", {
+        filePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return true;
+  }
 }
 
 /**
@@ -149,7 +200,7 @@ export async function startWatching(
   try {
     const subscription = await watcher.subscribe(
       resolvedPath,
-      (err: Error | null, events: Event[]) => {
+      async (err: Error | null, events: Event[]) => {
         if (err) {
           const count = (watcherErrorCounts.get(resolvedPath) ?? 0) + 1;
           watcherErrorCounts.set(resolvedPath, count);
@@ -177,16 +228,57 @@ export async function startWatching(
         // Reset error count on successful event delivery
         watcherErrorCounts.set(resolvedPath, 0);
 
-        // Filter events: only indexable files that pass ignore rules
-        const relevantEvents = events.filter((event) => {
-          if (!isIndexableFile(event.path)) return false;
-          const relative = path.relative(resolvedPath, event.path);
-          if (!relative || relative.startsWith("..")) return false;
-          return !shouldIgnore(ig, relative);
-        });
+        // Filter events: only indexable files that pass ignore rules. The
+        // indexability check is async because extensionless files are decided
+        // by content detection. @parcel/watcher ignores this callback's returned
+        // promise, so a rejection here would become an unhandled rejection —
+        // crashing the process or silently dropping the batch. Guard the whole
+        // body, mirroring the scheduleUpdate debounce ("log but don't crash").
+        try {
+          // Batch the (async, fd-opening) indexability checks like every other
+          // scan path (FILE_SCAN_BATCH), so a bulk change coalesced into one
+          // callback can't open hundreds of files at once and hit EMFILE.
+          const relevantEvents: Event[] = [];
+          for (let i = 0; i < events.length; i += FILE_SCAN_BATCH) {
+            const checked = await Promise.all(
+              events.slice(i, i + FILE_SCAN_BATCH).map(async (event): Promise<Event | null> => {
+                // Cheap synchronous checks first, so an ignored/out-of-tree file
+                // never triggers the async head-read (matches getIndexableFiles).
+                const relative = path.relative(resolvedPath, event.path);
+                if (!relative || relative.startsWith("..")) return null;
+                if (shouldIgnore(ig, relative)) return null;
+                if (await isIndexableFile(event.path)) return event;
+                // A previously-indexed extensionless file edited into readable
+                // non-code (detection now → null) is no longer "indexable", but
+                // its stale chunks/symbols must still be reconciled. Let
+                // extensionless *update* events through so updateProjectIndex
+                // purges it (a no-op if it was never indexed). Regular files
+                // only, kill-switch-gated and SPECIAL_FILES-excluded to match
+                // discovery, so directory/FIFO events schedule no churn.
+                if (
+                  event.type === "update" &&
+                  path.extname(event.path) === "" &&
+                  indexExtensionlessEnabled() &&
+                  !SPECIAL_FILES.has(path.basename(event.path))
+                ) {
+                  try {
+                    if ((await fsp.lstat(event.path)).isFile()) return event;
+                  } catch {
+                    /* vanished/unreadable — isIndexableFile already accounts for those */
+                  }
+                }
+                return null;
+              }),
+            );
+            for (const e of checked) if (e !== null) relevantEvents.push(e);
+          }
 
-        if (relevantEvents.length > 0) {
-          scheduleUpdate();
+          if (relevantEvents.length > 0) {
+            scheduleUpdate();
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.error("Watch event filtering failed", { projectPath: resolvedPath, error: message });
         }
       },
       {

@@ -184,5 +184,179 @@ describe.skipIf(!dockerAvailable)(
         try { fs.unlinkSync(filePath); } catch { /* ignore */ }
       }
     });
+
+    it("patches a detected extensionless Python file on the incremental path", async () => {
+      // A no-shebang Python file with NO extension. The `extra()` symbol is
+      // appended AFTER the full rebuild, so it can only reach the store via the
+      // incremental path, which skips any file whose getAstGrepLang(ext) is null
+      // unless the extension is re-detected first. Proves the gate re-detects it.
+      const rel = "deploy/gen-config";
+      const abs = path.join(fixture.root, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(
+        abs,
+        "def render_config():\n    return build_section()\n\ndef build_section():\n    return 1\n",
+        "utf-8",
+      );
+      try {
+        const graph = await rebuildGraph(fixture.root);
+        fs.appendFileSync(abs, "\ndef extra():\n    return render_config()\n", "utf-8");
+
+        const result = await updateChangedFilesSymbolGraph(projectId, fixture.root, graph, [rel], []);
+        expect(result.fullRebuildRequired).toBe(false);
+        expect(result.filesChanged).toBe(1);
+
+        const payload = await loadFilePayload(projectId, rel);
+        expect(payload).toBeTruthy();
+        expect(payload?.language).toBe("python");
+        const names = payload?.symbols.map((s) => s.name) ?? [];
+        expect(names).toEqual(expect.arrayContaining(["render_config", "build_section", "extra"]));
+      } finally {
+        try {
+          fs.rmSync(path.join(fixture.root, "deploy"), { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+
+    it("full rebuild persists a detected extensionless Python file; .txt-detected is excluded", async () => {
+      // Both graph paths: the incremental path is covered above; this covers
+      // the full rebuildGraph() path. A no-shebang Python file (grammar-bearing)
+      // is persisted with its symbols; a perl-shebang file (detected .txt) is
+      // grammar-less and must not enter the symbol graph.
+      const pyRel = "tools/gen";
+      const txtRel = "tools/legacy";
+      fs.mkdirSync(path.join(fixture.root, "tools"), { recursive: true });
+      fs.writeFileSync(
+        path.join(fixture.root, pyRel),
+        "def make_manifest():\n    return 1\n\nclass Builder:\n    def run(self):\n        return make_manifest()\n",
+        "utf-8",
+      );
+      fs.writeFileSync(path.join(fixture.root, txtRel), "#!/usr/bin/perl\nprint \"legacy\\n\";\n", "utf-8");
+      try {
+        await rebuildGraph(fixture.root);
+
+        const pyPayload = await loadFilePayload(projectId, pyRel);
+        expect(pyPayload).toBeTruthy();
+        expect(pyPayload?.language).toBe("python");
+        const names = pyPayload?.symbols.map((s) => s.name) ?? [];
+        expect(names).toEqual(expect.arrayContaining(["make_manifest", "Builder"]));
+
+        // .txt-detected file contributes no symbol payload (not in the graph).
+        const txtPayload = await loadFilePayload(projectId, txtRel);
+        expect(txtPayload).toBeNull();
+      } finally {
+        try {
+          fs.rmSync(path.join(fixture.root, "tools"), { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+
+    it("skips extensionless files on the incremental path when INDEX_EXTENSIONLESS=false", async () => {
+      const rel = "offswitch/gen";
+      const abs = path.join(fixture.root, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, "def off_marker():\n    return 1\n", "utf-8");
+      // Build the file-import graph with detection ON (so the file is present),
+      // then disable and run the incremental patch — it must skip the file.
+      const graph = await rebuildGraph(fixture.root, { skipSymbolGraph: true });
+      const prev = process.env.INDEX_EXTENSIONLESS;
+      process.env.INDEX_EXTENSIONLESS = "false";
+      try {
+        const result = await updateChangedFilesSymbolGraph(projectId, fixture.root, graph, [rel], []);
+        expect(result.fullRebuildRequired).toBe(false);
+        expect(result.filesChanged).toBe(0);
+      } finally {
+        if (prev === undefined) delete process.env.INDEX_EXTENSIONLESS;
+        else process.env.INDEX_EXTENSIONLESS = prev;
+        try {
+          fs.rmSync(path.join(fixture.root, "offswitch"), { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+
+    it("purges stale symbols when a changed extensionless file loses its grammar (grammar → .txt)", async () => {
+      const rel = "svc/gen";
+      const abs = path.join(fixture.root, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      // No-shebang Python → detected .py → symbols + an intra-file call edge
+      // (render_thing → helper) extracted and persisted, so the purge must
+      // decrement both the symbol and the edge counters.
+      fs.writeFileSync(abs, "def render_thing():\n    return helper()\n\ndef helper():\n    return 1\n", "utf-8");
+      try {
+        await rebuildGraph(fixture.root);
+        const before = await loadFilePayload(projectId, rel);
+        expect(before).toBeTruthy();
+        expect((before?.symbols ?? []).map((s) => s.name)).toContain("render_thing");
+
+        // Content now detects as .txt (unmapped perl shebang). It stays indexable,
+        // so it arrives as a *changed* (not removed) file — but its stale python
+        // symbols must be dropped to match a full rebuild (which excludes .txt).
+        fs.writeFileSync(abs, '#!/usr/bin/perl\nprint "no longer python\\n";\n', "utf-8");
+        const graph = await rebuildGraph(fixture.root, { skipSymbolGraph: true });
+        const result = await updateChangedFilesSymbolGraph(projectId, fixture.root, graph, [rel], []);
+        expect(result.fullRebuildRequired).toBe(false);
+        // Pin the removal bookkeeping (feeds persisted meta counts), not just the
+        // payload delete — else dropping the counter lines would go uncaught.
+        expect(result.filesRemoved).toBe(1);
+        expect(result.symbolsDelta).toBeLessThan(0);
+        expect(result.edgesDelta).toBeLessThan(0);
+
+        const after = await loadFilePayload(projectId, rel);
+        expect(after).toBeNull();
+      } finally {
+        try {
+          fs.rmSync(path.join(fixture.root, "svc"), { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+
+    it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+      "keeps a changed extensionless file's payload when its head-read fails transiently",
+      async () => {
+        const rel = "ro/probe";
+        const abs = path.join(fixture.root, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        // Readable code first → gets a persisted payload with symbols.
+        fs.writeFileSync(abs, "def a():\n    return b()\n\ndef b():\n    return 1\n", "utf-8");
+        try {
+          await rebuildGraph(fixture.root);
+          const before = await loadFilePayload(projectId, rel);
+          expect(before).toBeTruthy();
+          expect((before?.symbols ?? []).map((s) => s.name)).toContain("a");
+
+          // Now make the head-read fail (EACCES). A transient read failure must
+          // NOT be read as "lost grammar": the payload must survive, mirroring
+          // the extensioned readFile-catch path (an extensioned file with the
+          // same error keeps its payload).
+          fs.chmodSync(abs, 0o000);
+          const graph = await rebuildGraph(fixture.root, { skipSymbolGraph: true });
+          const result = await updateChangedFilesSymbolGraph(projectId, fixture.root, graph, [rel], []);
+          expect(result.filesRemoved).toBe(0);
+
+          const after = await loadFilePayload(projectId, rel);
+          expect(after).toBeTruthy();
+          expect((after?.symbols ?? []).map((s) => s.name)).toContain("a");
+        } finally {
+          try {
+            fs.chmodSync(abs, 0o644);
+          } catch {
+            /* ignore */
+          }
+          try {
+            fs.rmSync(path.join(fixture.root, "ro"), { recursive: true, force: true });
+          } catch {
+            /* ignore */
+          }
+        }
+      },
+    );
   },
 );

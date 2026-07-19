@@ -11,6 +11,7 @@ import type {
   CodeGraph, CodeGraphEdge, CodeGraphNode,
   SymbolEdge, SymbolGraphFilePayload, SymbolGraphMeta, SymbolNode, SymbolRef,
 } from "../types.js";
+import { resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
 import { buildCsNamespaceMap, buildGoModuleInfo, buildJvmSuffixMap, resolveImport } from "./graph-resolution.js";
@@ -602,6 +603,12 @@ export async function getGraphableFiles(
   const ig = createIgnoreFilter(projectPath);
   const extras = extraExts ?? EXTRA_EXTENSIONS;
   const files: string[] = [];
+  // Match getIndexableFiles' dotfile policy (glob dot:false by default) so the
+  // graph and the index admit the same extensionless *dotfiles* — otherwise a
+  // dot-named file like .bashrc/.profile would be graphed but never indexed
+  // (this walk sees dotfiles; the index's glob does not). (Files nested under a
+  // dot-directory are a separate, pre-existing divergence, not handled here.)
+  const includeDotFiles = (process.env.INCLUDE_DOT_FILES ?? "false").toLowerCase() === "true";
 
   async function walk(dir: string): Promise<void> {
     let entries: import("node:fs").Dirent[];
@@ -624,6 +631,17 @@ export async function getGraphableFiles(
         // Include if AST grammar is available OR if it's an extra extension
         if (getAstGrepLang(ext) !== null || extras.has(ext)) {
           files.push(relPath);
+        } else if (ext === "" && (includeDotFiles || !entry.name.startsWith("."))) {
+          // Extensionless: admit only when detection yields a grammar-bearing
+          // canonical extension. `.txt`-detected files stay out of the graph:
+          // we don't start adding grammar-less extensionless leaf nodes (extra-
+          // extension files remain the only grammar-less nodes, as before).
+          // Extensionless dotfiles are skipped unless INCLUDE_DOT_FILES, to stay
+          // consistent with the index (see includeDotFiles above).
+          const detected = await resolveExtensionlessExtension(fullPath);
+          if (detected && getAstGrepLang(detected) !== null) {
+            files.push(relPath);
+          }
         }
       }
     }
@@ -694,8 +712,24 @@ export async function buildCodeGraph(
   const goModuleInfo = hasGo ? buildGoModuleInfo(fileSet, resolvedPath) : undefined;
 
   for (const relPath of files) {
-    const ext = path.extname(relPath).toLowerCase();
-    const lang = getAstGrepLang(ext);
+    let ext = path.extname(relPath).toLowerCase();
+    let lang = getAstGrepLang(ext);
+
+    // Extensionless entries were admitted by getGraphableFiles only when
+    // detection yields a grammar-bearing extension, but it admits by path and
+    // does not carry the detected extension forward — so re-detect here to
+    // recover ext/lang.
+    if (!lang && ext === "") {
+      const detected = await resolveExtensionlessExtension(path.join(resolvedPath, relPath));
+      const detectedLang = detected ? getAstGrepLang(detected) : null;
+      // getGraphableFiles admits an extensionless entry only when detection
+      // yields a grammar-bearing extension. If the content changed since
+      // discovery (TOCTOU) so it no longer does — null, or a grammar-less
+      // `.txt` — skip it rather than adding a spurious grammar-less leaf node.
+      if (!detected || !detectedLang) continue;
+      ext = detected;
+      lang = detectedLang;
+    }
 
     // Files with no AST grammar (extra extensions) are included as leaf nodes
     // so they can be targets of import edges from other files, but we skip

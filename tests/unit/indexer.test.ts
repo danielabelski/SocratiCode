@@ -434,4 +434,113 @@ describe("indexer utilities", () => {
       }
     });
   });
+
+  describe("getIndexableFiles — extensionless detection", () => {
+    let root: string;
+
+    beforeAll(() => {
+      root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-idx-extless-"));
+      fs.mkdirSync(path.join(root, "bin"), { recursive: true });
+      fs.writeFileSync(
+        path.join(root, "bin", "strato-check-x"),
+        "#!/bin/bash\ncurl -sf localhost || exit 1\n",
+      );
+      fs.writeFileSync(path.join(root, "wscript"), "def build(bld):\n    bld.program(source='a.c')\n");
+      fs.writeFileSync(path.join(root, "LICENSE"), "MIT License\n\nCopyright (c) 2026\n");
+      fs.writeFileSync(path.join(root, "app.ts"), "export const x = 1;\n");
+      fs.writeFileSync(path.join(root, "blob"), Buffer.from([0x00, 0x01, 0x02, 0x03]));
+      fs.writeFileSync(path.join(root, ".profile"), 'set -eu\nif [ -d "$HOME/bin" ]; then\n  export PATH="$HOME/bin"\nfi\n');
+    });
+
+    afterAll(() => {
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    it("indexes detected extensionless scripts, skips non-code and binary", async () => {
+      const files = await getIndexableFiles(root);
+      expect(files).toContain("bin/strato-check-x");
+      expect(files).toContain("wscript");
+      expect(files).toContain("app.ts");
+      expect(files).not.toContain("LICENSE");
+      expect(files).not.toContain("blob");
+    });
+
+    it("restores old behavior when INDEX_EXTENSIONLESS=false", async () => {
+      vi.stubEnv("INDEX_EXTENSIONLESS", "false");
+      try {
+        const files = await getIndexableFiles(root);
+        expect(files).toContain("app.ts");
+        expect(files).not.toContain("bin/strato-check-x");
+        expect(files).not.toContain("wscript");
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it("indexes an extensionless code dotfile only when INCLUDE_DOT_FILES=true", async () => {
+      // Default: dotfiles are not globbed at all, so the graph must exclude them too.
+      expect(await getIndexableFiles(root)).not.toContain(".profile");
+      vi.stubEnv("INCLUDE_DOT_FILES", "true");
+      try {
+        expect(await getIndexableFiles(root)).toContain(".profile");
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+  });
+
+  describe("chunkFileContent — extensionless language", () => {
+    it("labels a detected shell probe as shell and preserves the path", () => {
+      const chunks = chunkFileContent("/proj/bin/strato-check-x", "bin/strato-check-x", "#!/bin/bash\necho ok\n");
+      expect(chunks.length).toBeGreaterThan(0);
+      expect(chunks[0].language).toBe("shell");
+      expect(chunks[0].relativePath).toBe("bin/strato-check-x");
+    });
+
+    it("labels a no-shebang Python wscript as python", () => {
+      const chunks = chunkFileContent("/proj/wscript", "wscript", "def build(bld):\n    pass\n");
+      expect(chunks[0].language).toBe("python");
+    });
+
+    it("produces no chunks when an extensionless file no longer detects as code", () => {
+      // If content changed since discovery admitted the file (TOCTOU) so it no
+      // longer detects as code, the chunker must emit nothing rather than index
+      // it as plaintext — matching getIndexableFiles' eligibility contract.
+      const chunks = chunkFileContent("/proj/was-a-probe", "was-a-probe", "just some prose, not code at all\n");
+      expect(chunks).toEqual([]);
+    });
+
+    it("leaves a SPECIAL_FILE (Makefile) as plaintext despite a shell-recipe body", () => {
+      // Load-bearing: this Makefile body sniffs to shell (tab-indented `set -e`,
+      // `if…then`), so removing chunkFileContent's SPECIAL_FILES guard would
+      // relabel it "shell". The guard must keep it "plaintext".
+      const chunks = chunkFileContent(
+        "/proj/Makefile",
+        "Makefile",
+        "build:\n\tset -euo pipefail\n\tif [ -f foo ]; then echo yes; fi\n",
+      );
+      expect(chunks[0].language).toBe("plaintext");
+    });
+
+    it("respects the kill-switch (plaintext when INDEX_EXTENSIONLESS=false)", () => {
+      vi.stubEnv("INDEX_EXTENSIONLESS", "false");
+      try {
+        const chunks = chunkFileContent("/proj/bin/probe", "bin/probe", "#!/bin/bash\necho ok\n");
+        expect(chunks[0].language).toBe("plaintext");
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it("detects on the head window only, not the whole file (>8 KiB)", async () => {
+      // Shell signals in the first 8 KiB, Python signals pushed well past it.
+      // chunk-time detection must inspect only the head (matching discovery), so
+      // this is "shell"; using the full content would flip it to "python".
+      const head = "set -eu\nif [ -f x ]; then\n  echo y\nfi\n";
+      const filler = "# comment line padding\n".repeat(400); // ~9 KiB, no code signals
+      const pyTail = "def render():\n    return 1\n\nclass C:\n    pass\n\nimport os\n";
+      const chunks = chunkFileContent("/proj/genscript", "genscript", head + filler + pyTail);
+      expect(chunks[0].language).toBe("shell");
+    });
+  });
 });
