@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
-import { type Dirent, readdirSync, readFileSync } from "node:fs";
+import { type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { toForwardSlash } from "../constants.js";
 import type { PathAliases } from "./graph-aliases.js";
@@ -300,8 +300,22 @@ function findGoModFiles(projectPath: string): string[] {
       if (shouldIgnore(ig, entry.isDirectory() ? `${relPath}/` : relPath)) continue;
       if (entry.isDirectory()) {
         walk(path.join(dir, entry.name));
-      } else if (entry.isFile() && entry.name === "go.mod") {
-        results.push(relPath);
+      } else if (entry.name === "go.mod") {
+        // readdirSync Dirents do not follow symlinks: a symlinked go.mod
+        // reports isFile()===false, so without this it would be neither
+        // recorded nor followed and a root-level symlinked go.mod would
+        // regress (the old single readFileSync followed the link). statSync
+        // resolves the link so a symlinked go.mod is discovered like a real
+        // one; broken links and non-file targets are skipped.
+        let isFile = entry.isFile();
+        if (!isFile && entry.isSymbolicLink()) {
+          try {
+            isFile = statSync(path.join(dir, entry.name)).isFile();
+          } catch {
+            continue;
+          }
+        }
+        if (isFile) results.push(relPath);
       }
     }
   };
