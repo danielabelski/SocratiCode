@@ -703,11 +703,14 @@ export async function buildCodeGraph(
   const hasCs = files.some((f) => path.extname(f).toLowerCase() === ".cs");
   const csNamespaceMap = hasCs ? buildCsNamespaceMap(fileSet, resolvedPath) : undefined;
 
-  // Build Go module-resolution info from go.mod (issue #45). Without this,
-  // every Go import resolved to null and Go projects produced an empty
-  // file graph. The info is null when go.mod is missing or unparseable;
-  // the resolver treats null as "no Go resolution available" and behaves
-  // exactly as it did before this PR for those cases.
+  // Build Go module-resolution info from every go.mod in the tree (issue
+  // #45 for a root-level go.mod; issue #82 for nested modules in a
+  // monorepo). Without this, every Go import resolved to null and Go
+  // projects produced an empty file graph. buildGoModuleInfo discovers
+  // go.mod itself (independently of the graphable file set) and returns
+  // one entry per module, or an empty array when none parse; the resolver
+  // treats an empty/undefined result as "no Go resolution available" and
+  // behaves exactly as it did before this feature for those cases.
   const hasGo = files.some((f) => f.endsWith(".go"));
   const goModuleInfo = hasGo ? buildGoModuleInfo(fileSet, resolvedPath) : undefined;
 
