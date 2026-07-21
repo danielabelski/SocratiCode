@@ -4,6 +4,21 @@ All notable changes to SocratiCode are documented here.
 This project uses [Conventional Commits](https://www.conventionalcommits.org/) and [Semantic Versioning](https://semver.org/).
 
 
+## [1.9.0](https://github.com/giancarloerra/socraticode/compare/v1.8.18...v1.9.0) (2026-07-21)
+
+### Features
+
+* **indexing:** index extensionless files via content-based language detection ([1304f3e](https://github.com/giancarloerra/socraticode/commit/1304f3e0467ccc2e5c7d520947a385e26b837e40))
+
+### Bug Fixes
+
+* **graph:** discover symlinked go.mod and lock in the ignore-filter branch ([#84](https://github.com/giancarloerra/socraticode/issues/84)) ([7b966e7](https://github.com/giancarloerra/socraticode/commit/7b966e78123fd9a9b35b5e4a102acc5381dffd13))
+* **graph:** resolve Go imports when go.mod is nested in a monorepo ([#82](https://github.com/giancarloerra/socraticode/issues/82)) ([b8c2d68](https://github.com/giancarloerra/socraticode/commit/b8c2d68558088adfadd7081b718c8b73dce37383)), closes [#45](https://github.com/giancarloerra/socraticode/issues/45)
+
+### Documentation
+
+* document INDEX_EXTENSIONLESS and extensionless-file detection ([ac7a92b](https://github.com/giancarloerra/socraticode/commit/ac7a92b376ed472f4d086a80b1dcbdff69996e9f))
+
 ## [1.8.18](https://github.com/giancarloerra/socraticode/compare/v1.8.17...v1.8.18) (2026-06-28)
 
 ### Features
