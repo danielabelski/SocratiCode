@@ -259,7 +259,7 @@ function extractFromLua(
     const rhs = kids.find((c: any) => c.kind() === "expression_list");
     if (!rhs) continue;
     const rhs0 = kidsOf(rhs)[0];
-    if (!rhs0 || rhs0.kind() !== "function_definition") continue;
+    if (rhs0?.kind() !== "function_definition") continue;
     // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
     const vl = kids.find((c: any) => c.kind() === "variable_list");
     const nameNode = vl ? kidsOf(vl)[0] : null;
