@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
-import { readFileSync } from "node:fs";
+import { type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { toForwardSlash } from "../constants.js";
 import type { PathAliases } from "./graph-aliases.js";
+import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 
 // ── Module resolution ────────────────────────────────────────────────────
 
@@ -120,38 +121,67 @@ export function buildCsNamespaceMap(
 }
 
 /**
- * Information needed to resolve Go imports to local files.
+ * Information needed to resolve Go imports to local files for ONE module.
  *
- * Built once per graph build by parsing the project's `go.mod` and walking
- * the file set. `modulePath` is the value of the `module` directive in
- * `go.mod` (e.g. `github.com/user/repo`); imports starting with this
- * prefix are local to the project. `packageMap` maps a Go package's
- * directory (relative to the project root, with "." for the root package)
- * to the lex-smallest non-test `.go` file in that directory, used as a
- * representative target for file-level edges in the graph.
+ * A project may contain several Go modules (a monorepo with nested
+ * `go.mod` files), so {@link buildGoModuleInfo} returns one of these per
+ * `go.mod` it discovers. `modulePath` is the value of the `module`
+ * directive in `go.mod` (e.g. `github.com/user/repo`); imports starting
+ * with this prefix are local to that module. `moduleDir` is the
+ * project-relative directory that contains `go.mod` ("." when it sits at
+ * the indexed root). `packageMap` maps a Go package's directory *relative
+ * to the module directory* (with "." for the module's own root package)
+ * to the lex-smallest non-test `.go` file in that directory (stored
+ * project-relative), used as a representative target for file-level edges.
  *
- * Returns null when `go.mod` is missing or malformed (no parseable
- * `module` directive). Callers must treat null as "no Go resolution
- * available" and return null for all Go imports.
+ * {@link buildGoModuleInfo} returns an empty array when no `go.mod` is
+ * found or none parse. Callers must treat an empty result as "no Go
+ * resolution available" and return null for all Go imports.
  */
 export interface GoModuleInfo {
   modulePath: string;
+  moduleDir: string;
   packageMap: Map<string, string>;
 }
 
 /**
- * Build Go module-resolution info for a project.
+ * Build Go module-resolution info for a project, one entry per `go.mod`.
  *
- * Reads `<projectPath>/go.mod` once, parses the module path with a regex,
- * and constructs a directory-to-representative-file map across all `.go`
- * files in the file set. `_test.go` files are excluded — Go does not
- * allow them to be imported from non-test code in other packages. Files
- * are sorted lexicographically before the map is built so the
- * representative chosen for each multi-file package is deterministic
- * across machines and runs.
+ * Discovers EVERY `go.mod` under the project root (so a monorepo with
+ * nested modules is supported, not just a single root-level `go.mod`),
+ * parses each module path with a regex, and constructs a per-module
+ * directory-to-representative-file map across the `.go` files owned by
+ * that module. `_test.go` files are excluded — Go does not allow them to
+ * be imported from non-test code in other packages. Files are sorted
+ * lexicographically before each map is built so the representative
+ * chosen for a multi-file package is deterministic across machines/runs.
  *
- * Cost: one `readFileSync` plus an O(n) walk over `.go` files at
- * graph-build time. Lookups during resolution are O(1).
+ * `go.mod` is discovered by walking the tree independently of `fileSet`:
+ * `go.mod` has no AST grammar and is not an extra extension, so it is
+ * NEVER admitted by `getGraphableFiles` and therefore never present in
+ * `fileSet`. An earlier attempt scanned `fileSet` for `go.mod` entries,
+ * which matched nothing in a real build and silently broke Go resolution
+ * for every project (issue #82, including the root-level #45 case). The
+ * walk reuses the same ignore filter `getGraphableFiles` uses, so a
+ * `go.mod` inside `node_modules/`, `.git/`, or a gitignored path is
+ * skipped.
+ *
+ * Each `.go` file is attributed to its DEEPEST owning module (the module
+ * whose `moduleDir` is the longest directory prefix of the file). The
+ * tie-break is directory DEPTH, not string length: the root module
+ * (`"."`, depth 0) must never win over a single-segment nested module
+ * whose directory name happens to be short (e.g. `z`, which is string
+ * length 1 just like `"."`).
+ *
+ * `packageMap` keys are MODULE-relative (the package directory with the
+ * module directory stripped), because a Go import strips the module path
+ * down to a module-relative directory. The map VALUES stay
+ * project-relative (they are the `fileSet` entries), so resolution needs
+ * no further translation even for a nested module.
+ *
+ * Cost: one tree walk (ignore-filtered) + one `readFileSync` per module
+ * plus an O(n) walk over `.go` files at graph-build time. Lookups during
+ * resolution are O(1).
  *
  * Limitations (deferred to follow-up issues if reported):
  *   - Parenthesized `module ( ... )` form (rare; not used by any
@@ -163,38 +193,134 @@ export interface GoModuleInfo {
 export function buildGoModuleInfo(
   fileSet: Set<string>,
   projectPath: string,
-): GoModuleInfo | null {
-  let goModSource: string;
-  try {
-    goModSource = readFileSync(path.join(projectPath, "go.mod"), "utf-8");
-  } catch {
-    return null;
+): GoModuleInfo[] {
+  const goModPaths = findGoModFiles(projectPath);
+  if (goModPaths.length === 0) return [];
+
+  interface RawModule {
+    moduleDir: string; // project-relative, forward-slash; "." at the root
+    modulePath: string; // declared `module` path
+    depth: number; // directory depth, for deepest-owner attribution
   }
+  const rawModules: RawModule[] = [];
+  for (const goModRel of goModPaths) {
+    let goModSource: string;
+    try {
+      goModSource = readFileSync(path.join(projectPath, goModRel), "utf-8");
+    } catch {
+      continue;
+    }
 
-  // Match `module <path>` at the start of a line, allowing leading
-  // horizontal whitespace and capturing the path token greedily up to
-  // the next whitespace. Module paths are non-whitespace tokens (e.g.
-  // `github.com/user/repo`, `go.uber.org/zap`).
-  const match = goModSource.match(/^[ \t]*module[ \t]+(\S+)/m);
-  if (!match) return null;
-  const modulePath = match[1];
+    // Match `module <path>` at the start of a line, allowing leading
+    // horizontal whitespace and capturing the path token greedily up to
+    // the next whitespace. Module paths are non-whitespace tokens (e.g.
+    // `github.com/user/repo`, `go.uber.org/zap`).
+    const match = goModSource.match(/^[ \t]*module[ \t]+(\S+)/m);
+    if (!match) continue;
+    const moduleDir = path.dirname(goModRel).replace(/\\/g, "/"); // "." for a root-level go.mod
+    const depth = moduleDir === "." ? 0 : moduleDir.split("/").length;
+    rawModules.push({ moduleDir, modulePath: match[1], depth });
+  }
+  if (rawModules.length === 0) return [];
 
+  // Precompute each .go file's owning module once. A file is owned by the
+  // DEEPEST module whose directory is a prefix of the file's directory
+  // (depth, not string length — see the function docstring).
   const goFiles = [...fileSet]
     .filter((f) => f.endsWith(".go") && !f.endsWith("_test.go"))
     .sort();
-
-  const packageMap = new Map<string, string>();
+  const ownerByFile = new Map<string, RawModule | null>();
   for (const f of goFiles) {
-    // Go import paths always use forward slashes. fileSet entries are
-    // also forward-slash-normalized (see toForwardSlash in constants.ts),
-    // so the key and value are both in the same form.
-    const dir = path.dirname(f).replace(/\\/g, "/"); // "." for files at the project root
-    if (!packageMap.has(dir)) {
-      packageMap.set(dir, f);
+    const fileDir = path.dirname(f).replace(/\\/g, "/");
+    let best: RawModule | null = null;
+    for (const mod of rawModules) {
+      // The root module (".") is a prefix of every path; a nested module
+      // owns a file only when the file's directory is itself or below it.
+      const owned =
+        mod.moduleDir === "." ||
+        fileDir === mod.moduleDir ||
+        fileDir.startsWith(`${mod.moduleDir}/`);
+      if (!owned) continue;
+      if (best === null || mod.depth > best.depth) best = mod;
     }
+    ownerByFile.set(f, best);
   }
 
-  return { modulePath, packageMap };
+  const modules: GoModuleInfo[] = [];
+  for (const mod of rawModules) {
+    const packageMap = new Map<string, string>();
+    for (const f of goFiles) {
+      if (ownerByFile.get(f) !== mod) continue;
+      const absDir = path.dirname(f).replace(/\\/g, "/");
+      // Strip the module directory to get the MODULE-relative package
+      // directory (the form a Go import resolves to). Go import paths
+      // always use forward slashes and fileSet entries are forward-slash-
+      // normalized (see toForwardSlash in constants.ts).
+      const dir =
+        mod.moduleDir === "."
+          ? absDir
+          : absDir === mod.moduleDir
+            ? "."
+            : absDir.slice(mod.moduleDir.length + 1); // absDir starts with `${mod.moduleDir}/`
+      if (!packageMap.has(dir)) {
+        packageMap.set(dir, f); // value stays project-relative (a fileSet entry)
+      }
+    }
+    modules.push({ modulePath: mod.modulePath, moduleDir: mod.moduleDir, packageMap });
+  }
+  return modules;
+}
+
+/**
+ * Discover every `go.mod` under `projectPath`, project-relative and
+ * forward-slash-normalized.
+ *
+ * `go.mod` is not a graphable file (no AST grammar, not an extra
+ * extension), so it is never in the set returned by `getGraphableFiles`.
+ * This walk is therefore independent of that set and is how
+ * {@link buildGoModuleInfo} finds modules without relying on `go.mod`
+ * being graphable (issue #82). The same ignore filter
+ * (`createIgnoreFilter` / `shouldIgnore`) `getGraphableFiles` uses is
+ * applied, with the same trailing-slash convention for directories, so a
+ * `go.mod` under `node_modules/`, `.git/`, or a gitignored path is
+ * skipped — exactly matching what the graphable walk would do.
+ */
+function findGoModFiles(projectPath: string): string[] {
+  const ig = createIgnoreFilter(projectPath);
+  const results: string[] = [];
+  const walk = (dir: string): void => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const relPath = toForwardSlash(path.relative(projectPath, path.join(dir, entry.name)));
+      if (shouldIgnore(ig, entry.isDirectory() ? `${relPath}/` : relPath)) continue;
+      if (entry.isDirectory()) {
+        walk(path.join(dir, entry.name));
+      } else if (entry.name === "go.mod") {
+        // readdirSync Dirents do not follow symlinks: a symlinked go.mod
+        // reports isFile()===false, so without this it would be neither
+        // recorded nor followed and a root-level symlinked go.mod would
+        // regress (the old single readFileSync followed the link). statSync
+        // resolves the link so a symlinked go.mod is discovered like a real
+        // one; broken links and non-file targets are skipped.
+        let isFile = entry.isFile();
+        if (!isFile && entry.isSymbolicLink()) {
+          try {
+            isFile = statSync(path.join(dir, entry.name)).isFile();
+          } catch {
+            continue;
+          }
+        }
+        if (isFile) results.push(relPath);
+      }
+    }
+  };
+  walk(projectPath);
+  return results.sort();
 }
 
 /**
@@ -210,7 +336,7 @@ export function resolveImport(
   aliases?: PathAliases,
   jvmSuffixMap?: Map<string, string>,
   csNamespaceMap?: Map<string, string[]>,
-  goModuleInfo?: GoModuleInfo | null,
+  goModuleInfo?: GoModuleInfo[] | null,
 ): string | null {
   // Skip obvious external/stdlib modules. Go is excluded from this
   // pre-check because its external classifier in `isExternalModule`
@@ -292,31 +418,52 @@ export function resolveImport(
     }
 
     case "go": {
-      // Local Go imports are rooted at the module path declared in go.mod
-      // (built by buildGoModuleInfo at graph-build time). When the import
-      // starts with that prefix, strip it to get the package's directory
-      // relative to the project root, then look up the representative
-      // file for that directory. Anything else (stdlib like "fmt",
-      // third-party packages like "github.com/x/y", or sibling-module
-      // paths that share a prefix textually but not structurally)
+      // Local Go imports are rooted at the module path declared in each
+      // go.mod (built by buildGoModuleInfo at graph-build time). A project
+      // may contain several modules (a monorepo with nested go.mod files),
+      // so pick the module whose declared path is the longest STRUCTURAL
+      // prefix of the import, then strip that prefix to get the package's
+      // directory relative to the module and look up its representative
+      // file. Anything else (stdlib like "fmt", third-party packages like
+      // "github.com/x/y", or a path that only shares a textual prefix)
       // resolves to null.
-      if (!goModuleInfo) return null;
-      if (!moduleSpecifier.startsWith(goModuleInfo.modulePath)) return null;
-      const rest = moduleSpecifier.slice(goModuleInfo.modulePath.length);
-      // rest === "" → the root package (the directory containing go.mod).
+      const modules = goModuleInfo ?? [];
+      if (modules.length === 0) return null;
+
+      let chosen: GoModuleInfo | null = null;
+      for (const mod of modules) {
+        // Structural prefix only: the import equals the module path (its
+        // root package) or is a direct subpackage (module path + "/").
+        // A bare textual prefix is NOT a match — e.g. with modules
+        // github.com/x and github.com/x/y, the import github.com/x/yother
+        // must resolve via github.com/x, not be misrouted to github.com/x/y
+        // and then rejected as a missing package.
+        const isMatch =
+          moduleSpecifier === mod.modulePath ||
+          moduleSpecifier.startsWith(`${mod.modulePath}/`);
+        if (!isMatch) continue;
+        if (chosen === null || mod.modulePath.length > chosen.modulePath.length) {
+          chosen = mod;
+        }
+      }
+      if (!chosen) return null;
+
+      const rest = moduleSpecifier.slice(chosen.modulePath.length);
+      // rest === "" → the module's root package (the dir containing go.mod).
       // rest starts with "/" → a subpackage; strip the leading slash.
-      // Anything else (e.g. an import that happens to share the prefix
-      // but isn't actually a subpackage, like
-      // `github.com/user/repo-other`) is external.
-      let dir: string;
+      // Anything else (an import that shares the prefix but isn't a real
+      // subpackage, e.g. `github.com/user/repo-other`) is external.
+      let moduleRelDir: string;
       if (rest === "") {
-        dir = ".";
+        moduleRelDir = ".";
       } else if (rest.startsWith("/")) {
-        dir = rest.slice(1);
+        moduleRelDir = rest.slice(1);
       } else {
         return null;
       }
-      return goModuleInfo.packageMap.get(dir) ?? null;
+      // packageMap values are already project-relative fileSet entries,
+      // so no further translation is needed — even for a nested module.
+      return chosen.packageMap.get(moduleRelDir) ?? null;
     }
 
     case "java":
