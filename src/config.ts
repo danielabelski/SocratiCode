@@ -87,6 +87,39 @@ function readProjectIdFromConfigFile(folderPath: string): string | null {
  * appended to the hash, producing a separate set of collections per
  * branch.
  */
+export function projectIdFromPath(folderPath: string): string {
+  const envExplicit = process.env.SOCRATICODE_PROJECT_ID?.trim();
+  if (envExplicit) {
+    assertValidProjectId(envExplicit, "SOCRATICODE_PROJECT_ID");
+    warnBranchAwareIgnored(envExplicit, "SOCRATICODE_PROJECT_ID", folderPath);
+    return envExplicit;
+  }
+
+  const fileExplicit = readProjectIdFromConfigFile(folderPath);
+  if (fileExplicit) {
+    warnBranchAwareIgnored(fileExplicit, ".socraticode.json projectId", folderPath);
+    return fileExplicit;
+  }
+
+  let id = coreProjectId(folderPath);
+
+  // Branch-aware mode: append sanitized branch name to isolate per-branch indexes
+  if (process.env.SOCRATICODE_BRANCH_AWARE === "true") {
+    const branch = detectGitBranch(path.resolve(folderPath));
+    if (branch) {
+      const sanitized = sanitizeBranchName(branch);
+      if (sanitized) {
+        id = `${id}__${sanitized}`;
+      }
+    }
+  }
+
+  return id;
+}
+
+/** The two ways a project can pin an id, named for the diagnostic below. */
+type ExplicitIdSource = "SOCRATICODE_PROJECT_ID" | ".socraticode.json projectId";
+
 /**
  * Projects already warned that their branch-aware setting is being ignored.
  *
@@ -106,50 +139,34 @@ const branchAwareIgnoredWarned = new Set<string>();
  * the collections of every existing installation and make their indexes look
  * missing. What was wrong was doing it silently — the setting is accepted and
  * simply does nothing, so the only way to find out was to read this file.
+ *
+ * The branch is resolved here rather than by the caller because this runs once
+ * per affected project: it costs one git invocation per project, not one per id
+ * resolution. It is needed for the advice to be true — where no branch can be
+ * detected, removing the explicit id would change the project's identity and
+ * still produce no suffix.
  */
-function warnBranchAwareIgnored(projectId: string, source: string): void {
+function warnBranchAwareIgnored(
+  projectId: string,
+  source: ExplicitIdSource,
+  folderPath: string,
+): void {
   if (process.env.SOCRATICODE_BRANCH_AWARE !== "true") return;
   if (branchAwareIgnoredWarned.has(projectId)) return;
   branchAwareIgnoredWarned.add(projectId);
+
+  const branch = detectGitBranch(folderPath);
   logger.warn(
     "SOCRATICODE_BRANCH_AWARE is ignored for this project because an explicit project id takes precedence — every branch shares one index",
     {
       projectId,
       explicitIdFrom: source,
-      howToGetPerBranchIndexes:
-        "remove the explicit project id so the path-derived id can carry a branch suffix, or set a branch-specific SOCRATICODE_PROJECT_ID deliberately",
+      branch: branch ?? "(none detected)",
+      howToGetPerBranchIndexes: branch
+        ? `remove the explicit project id so the path-derived id can carry the "${sanitizeBranchName(branch)}" suffix, or set a branch-specific SOCRATICODE_PROJECT_ID deliberately`
+        : "this project has no detectable git branch (not a repository, or a detached HEAD), so branch-aware mode would produce no suffix here even without an explicit id",
     },
   );
-}
-
-export function projectIdFromPath(folderPath: string): string {
-  const envExplicit = process.env.SOCRATICODE_PROJECT_ID?.trim();
-  if (envExplicit) {
-    assertValidProjectId(envExplicit, "SOCRATICODE_PROJECT_ID");
-    warnBranchAwareIgnored(envExplicit, "SOCRATICODE_PROJECT_ID");
-    return envExplicit;
-  }
-
-  const fileExplicit = readProjectIdFromConfigFile(folderPath);
-  if (fileExplicit) {
-    warnBranchAwareIgnored(fileExplicit, ".socraticode.json projectId");
-    return fileExplicit;
-  }
-
-  let id = coreProjectId(folderPath);
-
-  // Branch-aware mode: append sanitized branch name to isolate per-branch indexes
-  if (process.env.SOCRATICODE_BRANCH_AWARE === "true") {
-    const branch = detectGitBranch(path.resolve(folderPath));
-    if (branch) {
-      const sanitized = sanitizeBranchName(branch);
-      if (sanitized) {
-        id = `${id}__${sanitized}`;
-      }
-    }
-  }
-
-  return id;
 }
 
 /**

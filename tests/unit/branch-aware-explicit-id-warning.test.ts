@@ -19,7 +19,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const warn = vi.fn();
+// vi.mock factories are hoisted above surrounding declarations, so the spy has
+// to be created inside vi.hoisted rather than closed over from a plain const.
+const { warn } = vi.hoisted(() => ({ warn: vi.fn() }));
 
 vi.mock("../../src/services/logger.js", () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
@@ -35,6 +37,20 @@ function makeProject(name: string, config?: Record<string, unknown>): string {
   if (config) {
     fs.writeFileSync(path.join(dir, ".socraticode.json"), JSON.stringify(config));
   }
+  return dir;
+}
+
+/** A project on a real, born branch — `rev-parse HEAD` throws until there is a commit. */
+function makeGitProject(name: string, branch: string, config?: Record<string, unknown>): string {
+  const dir = makeProject(name, config);
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: dir, stdio: ["pipe", "pipe", "pipe"] });
+  execFileSync("git", ["init", "-b", branch, dir], { stdio: ["pipe", "pipe", "pipe"] });
+  git("config", "user.name", "test");
+  git("config", "user.email", "test@test.com");
+  fs.writeFileSync(path.join(dir, "a.txt"), "x\n");
+  git("add", "-A");
+  git("commit", "-m", "init");
   return dir;
 }
 
@@ -82,17 +98,44 @@ describe("branch-aware ignored because an explicit id won", () => {
     expect(warn.mock.calls[0][1]).toMatchObject({ explicitIdFrom: ".socraticode.json projectId" });
   });
 
-  it("says how to actually get per-branch collections", async () => {
+  it("says how to actually get per-branch collections, naming the branch", async () => {
     // A diagnostic that only says "ignored" leaves the reader where they
     // started; the whole complaint was that the setting gave no guidance.
     process.env.SOCRATICODE_PROJECT_ID = "pinned";
     process.env.SOCRATICODE_BRANCH_AWARE = "true";
     const { projectIdFromPath } = await import("../../src/config.js");
-    projectIdFromPath(makeProject("c"));
+    projectIdFromPath(makeGitProject("c", "feat/thing"));
 
-    expect(String(JSON.stringify(warn.mock.calls[0][1]))).toMatch(
-      /remove the explicit project id|branch-specific SOCRATICODE_PROJECT_ID/,
-    );
+    const ctx = warn.mock.calls[0][1] as Record<string, string>;
+    expect(ctx.branch).toBe("feat/thing");
+    expect(ctx.howToGetPerBranchIndexes).toMatch(/remove the explicit project id/);
+    // The suffix it would actually receive, not the raw branch name.
+    expect(ctx.howToGetPerBranchIndexes).toContain("feat_thing");
+  });
+
+  it("does not advise removing the id when no branch could be detected", async () => {
+    // Following that advice in a non-git project would change the project's
+    // identity, orphan its collection, and still produce no suffix.
+    process.env.SOCRATICODE_PROJECT_ID = "pinned";
+    process.env.SOCRATICODE_BRANCH_AWARE = "true";
+    const { projectIdFromPath } = await import("../../src/config.js");
+    projectIdFromPath(makeProject("c-nogit"));
+
+    const ctx = warn.mock.calls[0][1] as Record<string, string>;
+    expect(ctx.branch).toBe("(none detected)");
+    expect(ctx.howToGetPerBranchIndexes).toMatch(/no detectable git branch/);
+    expect(ctx.howToGetPerBranchIndexes).not.toMatch(/remove the explicit project id/);
+  });
+
+  it("rejects an invalid explicit id before warning about it", async () => {
+    // assertValidProjectId runs first, so an id the process is about to refuse
+    // is never entered into the dedupe set nor logged as a live project id.
+    process.env.SOCRATICODE_PROJECT_ID = "not a valid id!";
+    process.env.SOCRATICODE_BRANCH_AWARE = "true";
+    const { projectIdFromPath } = await import("../../src/config.js");
+
+    expect(() => projectIdFromPath(makeProject("c-invalid"))).toThrow();
+    expect(warnings()).toHaveLength(0);
   });
 
   it("warns once per project, not once per call", async () => {
@@ -149,19 +192,7 @@ describe("nothing about resolution changed", () => {
     // is legitimately absent, and this would pass either way.
     process.env.SOCRATICODE_BRANCH_AWARE = "true";
     const { projectIdFromPath } = await import("../../src/config.js");
-    const repo = makeProject("i");
-    const git = (...args: string[]) =>
-      execFileSync("git", args, { cwd: repo, stdio: ["pipe", "pipe", "pipe"] });
-    execFileSync("git", ["init", "-b", "feat/my-feature", repo], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    // `rev-parse --abbrev-ref HEAD` throws while the branch is unborn, so the
-    // detector would answer null and the suffix would be legitimately absent.
-    git("config", "user.name", "test");
-    git("config", "user.email", "test@test.com");
-    fs.writeFileSync(path.join(repo, "a.txt"), "x\n");
-    git("add", "-A");
-    git("commit", "-m", "init");
+    const repo = makeGitProject("i", "feat/my-feature");
 
     const id = projectIdFromPath(repo);
 
