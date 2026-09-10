@@ -117,6 +117,26 @@ export function projectIdFromPath(folderPath: string): string {
   return id;
 }
 
+/**
+ * What the user would actually have to do to get per-branch collections.
+ *
+ * Three states, not two. A branch existing is not enough: `sanitizeBranchName`
+ * strips every character that cannot appear in a collection name, so a legal
+ * branch such as `___` reduces to the empty string and `projectIdFromPath`
+ * returns the unsuffixed id anyway. Advising removal of the explicit id there
+ * would change the project's identity and still produce no per-branch index.
+ */
+function perBranchAdvice(branch: string | null): string {
+  if (!branch) {
+    return "this project has no detectable git branch (not a repository, or a detached HEAD), so branch-aware mode would produce no suffix here even without an explicit id";
+  }
+  const suffix = sanitizeBranchName(branch);
+  if (!suffix) {
+    return `the branch "${branch}" contains no characters usable in a collection name, so it would produce no suffix even without an explicit id — set a branch-specific SOCRATICODE_PROJECT_ID instead`;
+  }
+  return `remove the explicit project id so the path-derived id can carry the "${suffix}" suffix, or set a branch-specific SOCRATICODE_PROJECT_ID deliberately`;
+}
+
 /** The two ways a project can pin an id, named for the diagnostic below. */
 type ExplicitIdSource = "SOCRATICODE_PROJECT_ID" | ".socraticode.json projectId";
 
@@ -162,9 +182,7 @@ function warnBranchAwareIgnored(
       projectId,
       explicitIdFrom: source,
       branch: branch ?? "(none detected)",
-      howToGetPerBranchIndexes: branch
-        ? `remove the explicit project id so the path-derived id can carry the "${sanitizeBranchName(branch)}" suffix, or set a branch-specific SOCRATICODE_PROJECT_ID deliberately`
-        : "this project has no detectable git branch (not a repository, or a detached HEAD), so branch-aware mode would produce no suffix here even without an explicit id",
+      howToGetPerBranchIndexes: perBranchAdvice(branch),
     },
   );
 }

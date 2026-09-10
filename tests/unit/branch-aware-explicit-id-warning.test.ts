@@ -48,6 +48,10 @@ function makeGitProject(name: string, branch: string, config?: Record<string, un
   execFileSync("git", ["init", "-b", branch, dir], { stdio: ["pipe", "pipe", "pipe"] });
   git("config", "user.name", "test");
   git("config", "user.email", "test@test.com");
+  // A developer's global config commonly has commit.gpgsign=true, which fails
+  // in a throwaway repo with no signing key. config.test.ts does the same.
+  git("config", "commit.gpgsign", "false");
+  git("config", "tag.gpgsign", "false");
   fs.writeFileSync(path.join(dir, "a.txt"), "x\n");
   git("add", "-A");
   git("commit", "-m", "init");
@@ -124,6 +128,21 @@ describe("branch-aware ignored because an explicit id won", () => {
     const ctx = warn.mock.calls[0][1] as Record<string, string>;
     expect(ctx.branch).toBe("(none detected)");
     expect(ctx.howToGetPerBranchIndexes).toMatch(/no detectable git branch/);
+    expect(ctx.howToGetPerBranchIndexes).not.toMatch(/remove the explicit project id/);
+  });
+
+it("does not advise removing the id when the branch sanitizes to nothing", async () => {
+    // `___` is a legal branch name and sanitizeBranchName strips it to "", so
+    // projectIdFromPath returns the unsuffixed id — removing the explicit id
+    // would change identity and still produce no per-branch index.
+    process.env.SOCRATICODE_PROJECT_ID = "pinned";
+    process.env.SOCRATICODE_BRANCH_AWARE = "true";
+    const { projectIdFromPath } = await import("../../src/config.js");
+    projectIdFromPath(makeGitProject("c-unusable", "___"));
+
+    const ctx = warn.mock.calls[0][1] as Record<string, string>;
+    expect(ctx.branch).toBe("___");
+    expect(ctx.howToGetPerBranchIndexes).toMatch(/no characters usable/);
     expect(ctx.howToGetPerBranchIndexes).not.toMatch(/remove the explicit project id/);
   });
 

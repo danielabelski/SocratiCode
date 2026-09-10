@@ -1118,6 +1118,11 @@ SOCRATICODE_BRANCH_AWARE=true
 
 With this enabled, collection names include the branch name (e.g. `codebase_abc123__main`, `codebase_abc123__feat_my-feature`). Each branch maintains its own independent index, code graph, and context artifacts.
 
+> **Also requires a usable branch name.** Branch names are sanitized for use in
+> collection names, so a branch made only of separators (e.g. `___`) reduces to
+> an empty suffix and no per-branch collection is created. Where that happens,
+> set a branch-specific `SOCRATICODE_PROJECT_ID` instead.
+
 > **Only applies to path-derived project ids.** If the project pins an id — via
 > `SOCRATICODE_PROJECT_ID` or `projectId` in `.socraticode.json` — that id is
 > treated as a stable identity and is never given a branch suffix, so every
