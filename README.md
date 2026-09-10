@@ -568,7 +568,7 @@ On VS Code's 2.45M‑line codebase, SocratiCode answers architectural questions 
 - **Parallel processing** — Files are scanned and chunked in parallel batches (50 at a time) for fast I/O, while embedding generation and upserts are batched separately for optimal throughput.
 - **Multi-project** — Index multiple projects simultaneously. Each gets its own isolated collection with full project path tracking.
 - **Cross-project search** — Search across multiple related projects in a single query. Link projects via `.socraticode.json` or the `SOCRATICODE_LINKED_PROJECTS` env var, then set `includeLinked: true` on `codebase_search`. Results are tagged with project labels and ranked by cosine similarity, which is comparable across projects of very different sizes (falling back to rank fusion when a cosine is unavailable for any hit).
-- **Branch-aware indexing** — Maintain separate indexes per git branch by setting `SOCRATICODE_BRANCH_AWARE=true`. Each branch gets its own Qdrant collections, so switching branches instantly switches to the correct index. Ideal for CI/CD pipelines and PR review workflows.
+- **Branch-aware indexing** — Maintain separate indexes per git branch by setting `SOCRATICODE_BRANCH_AWARE=true`. Each branch gets its own Qdrant collections, so switching branches instantly switches to the correct index. Ideal for CI/CD pipelines and PR review workflows. Requires a path-derived project id: an explicit id (`SOCRATICODE_PROJECT_ID`, or `projectId` in `.socraticode.json`) is treated as a stable identity and is never suffixed, so branch-aware mode does not apply to those projects.
 - **Respects ignore rules** — Honors all `.gitignore` files (root + nested), plus an optional `.socraticodeignore` for additional exclusions. Includes sensible built-in defaults. `.gitignore` processing can be disabled via `RESPECT_GITIGNORE=false`. Dot-directories (e.g. `.agent`) can be included via `INCLUDE_DOT_FILES=true`.
 - **Custom file extensions** — Projects with non-standard extensions (e.g. `.tpl`, `.blade`) can be included via `EXTRA_EXTENSIONS` env var or `extraExtensions` tool parameter. Such files are indexed as plaintext and appear as leaf nodes in the code graph (no AST chunking or symbols). To instead treat a custom extension as a real language (full AST chunking, symbols, call graph), map it with `EXTENSION_LANGUAGE_MAP` (e.g. `.inc:php`).
 - **Configurable infrastructure** — All ports, hosts, and API keys are configurable via environment variables. Qdrant API key support for enterprise deployments.
@@ -1117,6 +1117,16 @@ SOCRATICODE_BRANCH_AWARE=true
 ```
 
 With this enabled, collection names include the branch name (e.g. `codebase_abc123__main`, `codebase_abc123__feat_my-feature`). Each branch maintains its own independent index, code graph, and context artifacts.
+
+> **Only applies to path-derived project ids.** If the project pins an id — via
+> `SOCRATICODE_PROJECT_ID` or `projectId` in `.socraticode.json` — that id is
+> treated as a stable identity and is never given a branch suffix, so every
+> branch continues to share one index. This is deliberate: suffixing an explicit
+> id would change the collection names an existing installation already uses and
+> make its indexes appear missing. SocratiCode logs a warning once per project
+> when branch-aware mode is enabled but ignored for this reason. To get
+> per-branch collections, remove the explicit id so the path-derived id can carry
+> the suffix, or set a branch-specific `SOCRATICODE_PROJECT_ID` deliberately.
 
 **When to use:**
 - CI/CD pipelines that index each branch/PR separately

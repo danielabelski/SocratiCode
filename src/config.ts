@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { QDRANT_COLLECTION_PREFIX } from "./constants.js";
+import { logger } from "./services/logger.js";
 
 // ── Branch detection ─────────────────────────────────────────────────────
 
@@ -86,15 +87,52 @@ function readProjectIdFromConfigFile(folderPath: string): string | null {
  * appended to the hash, producing a separate set of collections per
  * branch.
  */
+/**
+ * Projects already warned that their branch-aware setting is being ignored.
+ *
+ * `projectIdFromPath` runs on essentially every tool call, so without this the
+ * warning would repeat for the life of the process. Keyed by the resolved id
+ * rather than the path, because the whole point of an explicit id is that
+ * several paths share one.
+ */
+const branchAwareIgnoredWarned = new Set<string>();
+
+/**
+ * Warn once when `SOCRATICODE_BRANCH_AWARE=true` has no effect because an
+ * explicit project id won.
+ *
+ * The precedence itself is deliberate and documented: an explicit id is a
+ * stable identity and is not augmented per branch. Suffixing it would rename
+ * the collections of every existing installation and make their indexes look
+ * missing. What was wrong was doing it silently — the setting is accepted and
+ * simply does nothing, so the only way to find out was to read this file.
+ */
+function warnBranchAwareIgnored(projectId: string, source: string): void {
+  if (process.env.SOCRATICODE_BRANCH_AWARE !== "true") return;
+  if (branchAwareIgnoredWarned.has(projectId)) return;
+  branchAwareIgnoredWarned.add(projectId);
+  logger.warn(
+    "SOCRATICODE_BRANCH_AWARE is ignored for this project because an explicit project id takes precedence — every branch shares one index",
+    {
+      projectId,
+      explicitIdFrom: source,
+      howToGetPerBranchIndexes:
+        "remove the explicit project id so the path-derived id can carry a branch suffix, or set a branch-specific SOCRATICODE_PROJECT_ID deliberately",
+    },
+  );
+}
+
 export function projectIdFromPath(folderPath: string): string {
   const envExplicit = process.env.SOCRATICODE_PROJECT_ID?.trim();
   if (envExplicit) {
     assertValidProjectId(envExplicit, "SOCRATICODE_PROJECT_ID");
+    warnBranchAwareIgnored(envExplicit, "SOCRATICODE_PROJECT_ID");
     return envExplicit;
   }
 
   const fileExplicit = readProjectIdFromConfigFile(folderPath);
   if (fileExplicit) {
+    warnBranchAwareIgnored(fileExplicit, ".socraticode.json projectId");
     return fileExplicit;
   }
 
