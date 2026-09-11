@@ -51,7 +51,10 @@ their own MCP configuration.
   architecture docs alongside code. The AI sees the schema your team
   designed, not what it guessed from filenames.
 - **Branch-aware indexing**: every branch gets its own index, so PR
-  reviews see the code actually being reviewed.
+  reviews see the code actually being reviewed. Applies only to
+  path-derived project IDs: a project that sets `SOCRATICODE_PROJECT_ID`
+  or `projectId` in `.socraticode.json` keeps one index shared by every
+  branch, and SocratiCode logs a warning saying so.
 
 ## Built for real-world big teams and projects
 
