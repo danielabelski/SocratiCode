@@ -301,21 +301,21 @@ describe.skipIf(!shouldRun)("content past the character cap is retrievable", () 
       // chunks would not show that — a regression dropping a middle piece
       // leaves more than one behind — so check coverage instead.
       //
-      // Order-independent on purpose. Sorting by startLine would not be enough:
-      // every piece of one over-cap line carries the same startLine, so a
-      // fixture with such a line could not be put back in order this way.
       const stored = await searchChunks(collection, TAIL_MARKER, 50);
       expect(stored.length).toBeGreaterThan(1);
       for (const result of stored) {
         expect(result.content.length).toBeLessThanOrEqual(MAX_CHUNK_CHARS);
         expect(source).toContain(result.content);
       }
-      // The pieces are slices of the file and do not overlap, so their lengths
-      // add up to it exactly. Less means a piece was lost; more means one was
-      // stored twice. (This fixture holds no whitespace-only piece, which the
-      // splitter drops by design.)
-      const storedChars = stored.reduce((total, result) => total + result.content.length, 0);
-      expect(storedChars).toBe(source.length);
+      // This fixture splits only at newlines, so each piece has a distinct
+      // startLine. Reconstructing the exact source catches an omitted or
+      // replaced equal-length piece that a length total would miss. (The
+      // fixture holds no whitespace-only piece, which the splitter drops.)
+      const reconstructed = [...stored]
+        .sort((left, right) => left.startLine - right.startLine)
+        .map((result) => result.content)
+        .join("");
+      expect(reconstructed).toBe(source);
     } finally {
       await cleanupTestCollections(project).catch(() => undefined);
       // Indexing also builds the symbol graph, whose collections

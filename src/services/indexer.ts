@@ -584,30 +584,24 @@ function splitToCharCap(
 /**
  * Split one over-long chunk into cap-sized pieces.
  *
- * The split itself is `chunkByCharacters` at format 2, which already owns the
- * boundary rule, the newline-counted line tracking and a discriminator unique
- * within one call. Only the ids and the line numbers are rebased onto the
- * parent, so the pieces stay addressable and keep pointing at the lines they
- * came from.
+ * Ordinary source and prose use the newline-first boundary rule. Minified code
+ * has a separate token-safe rule in `chunkByCharacters`; routing this path
+ * through that chunker would make ordinary chunks change representation too.
+ * The ids and line numbers here are rebased onto the parent, so the pieces stay
+ * addressable and keep pointing at the lines they came from.
  */
 function splitOversizedChunk(chunk: FileChunk, maxChunkChars: number): FileChunk[] {
   // Only reachable for format 2: splitToCharCap returns before this for a
   // collection stored below it.
-  const pieces = chunkByCharacters(
-    chunk.filePath,
-    chunk.relativePath,
-    chunk.content,
-    chunk.language,
-    maxChunkChars,
-    SPLITTING_INDEX_FORMAT_VERSION,
-  );
+  const pieces = splitTextToCharCap(chunk.content, maxChunkChars);
   return pieces.map((piece, index) => ({
-    ...piece,
+    ...chunk,
+    content: piece.text,
     // The first piece inherits the parent's identity — same id, same startLine —
     // so a chunk that needed no splitting and one that did agree on where they
     // begin. Continuations are seeded from the parent id (see continuationId).
     id: index === 0 ? chunk.id : continuationId(chunk.id, index),
-    // chunkByCharacters counts lines from 1 within the slice it was given; the
+    // split helper counts lines from 1 within the slice it was given; the
     // parent's own startLine puts them back on the file's line numbering. This
     // also re-derives the parent's endLine, which truncation used to leave
     // claiming lines the chunk no longer held.
@@ -632,8 +626,8 @@ function splitOversizedChunk(chunk: FileChunk, maxChunkChars: number): FileChunk
  * a collection keeps the representation it was created with. Format 0 and 1
  * run the released scan, which accepts a newline, space, tab, semicolon or
  * comma near the end of the window and so usually avoids splitting
- * mid-identifier. Format 2 ends a piece at the last newline at or before the
- * cap, and at the cap itself where the span holds no newline — see
+ * mid-identifier. Format 2 preserves that boundary set, but bounds the scan
+ * inside the cap and corrects line-ending and Unicode-pair handling — see
  * splitTextToCharCap.
  *
  * NOTE: The chunk `id` uses the byte offset as its discriminator (not the
@@ -657,7 +651,7 @@ function chunkByCharacters(
   }
 
   let offset = 0;
-  return splitTextToCharCap(content, maxChunkChars).map((piece) => {
+  return splitTextToCharCap(content, maxChunkChars, "code-token").map((piece) => {
     const chunk: FileChunk = {
       id: chunkId(relativePath, offset), // byte offset → unique ID even for 1-line files
       filePath,

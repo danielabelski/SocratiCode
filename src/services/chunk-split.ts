@@ -56,6 +56,9 @@ export interface TextPiece {
   endLine: number;
 }
 
+/** Boundaries considered while looking backwards inside one capped window. */
+export type TextBoundaryMode = "newline" | "code-token";
+
 /**
  * Split text into pieces of at most `maxChunkChars` characters — one more only
  * where a surrogate pair or a CRLF would otherwise be divided.
@@ -63,21 +66,30 @@ export interface TextPiece {
  * Every character of the input appears in exactly one piece, in order:
  * concatenating `text` across the result reproduces the input.
  *
- * Each piece ends at the last newline at or before the cap, so a line is never
- * divided and the line range stored on the chunk stays true. When the span
- * holds no newline — a minified bundle, one very long line — the piece ends at
- * the cap.
+ * By default each piece ends at the last newline at or before the cap, so a
+ * line is never divided and the line range stored on the chunk stays true.
+ * Minified code can instead select `code-token`, which also accepts the
+ * released chunker's space, tab, semicolon and comma boundaries so identifiers
+ * are not divided where a safe boundary exists inside the capped window. When
+ * the span holds no eligible boundary, the piece ends at the cap.
  *
  * Text at or below the cap comes back as a single piece, so callers can use
  * this unconditionally.
  */
-export function splitTextToCharCap(content: string, maxChunkChars: number): TextPiece[] {
+export function splitTextToCharCap(
+  content: string,
+  maxChunkChars: number,
+  boundaryMode: TextBoundaryMode = "newline",
+): TextPiece[] {
   // A cap below 1 would leave `end` equal to `offset` and loop forever emitting
   // empty pieces. The env-var path cannot reach this (constants.ts and
   // parseEffectiveIndexProfile both reject it), but chunkFileContent and
   // chunkArtifactContent take the cap as an argument and are exported.
   if (!Number.isInteger(maxChunkChars) || maxChunkChars < 1) {
     throw new Error(`maxChunkChars must be a positive integer, got ${maxChunkChars}`);
+  }
+  if (boundaryMode !== "newline" && boundaryMode !== "code-token") {
+    throw new Error(`Unknown text boundary mode: ${String(boundaryMode)}`);
   }
 
   const pieces: TextPiece[] = [];
@@ -88,9 +100,9 @@ export function splitTextToCharCap(content: string, maxChunkChars: number): Text
     let end = Math.min(offset + maxChunkChars, content.length);
 
     if (end < content.length) {
-      // The last newline at or before the cap: scan back from `end - 1` so the
-      // newline itself is inside the piece, and ending just past it keeps the
-      // line whole.
+      // The last eligible boundary at or before the cap: scan back from
+      // `end - 1` so the boundary itself is inside the piece. Starting at
+      // `end` would accept one character beyond the cap.
       //
       // Bounded at `offset` deliberately. String.lastIndexOf has no lower
       // bound, so on content holding no newline at all it would run back to
@@ -98,18 +110,28 @@ export function splitTextToCharCap(content: string, maxChunkChars: number): Text
       // scan was linear because it stopped at the window. That input is not
       // hypothetical: a one-line bundle is what MAX_AVG_LINE_LENGTH routes
       // here, MAX_FILE_BYTES lets it reach 5 MB, and chunking is synchronous.
-      let newline = -1;
-      for (let i = end - 1; i >= offset; i--) {
-        if (content.charCodeAt(i) === 0x0a) {
-          newline = i;
+      let boundary = -1;
+      // The code-token mode does not select a delimiter at the first character
+      // of a window: that would emit a one-character piece instead of making
+      // useful progress towards the cap. The newline mode keeps that option so
+      // a leading newline can remain a complete line-ending piece at cap 1.
+      const firstCandidate = boundaryMode === "code-token" ? offset + 1 : offset;
+      for (let i = end - 1; i >= firstCandidate; i--) {
+        const code = content.charCodeAt(i);
+        const eligible =
+          code === 0x0a ||
+          (boundaryMode === "code-token" &&
+            (code === 0x20 || code === 0x09 || code === 0x3b || code === 0x2c));
+        if (eligible) {
+          boundary = i;
           break;
         }
       }
-      if (newline >= offset) {
-        end = newline + 1;
+      if (boundary >= firstCandidate) {
+        end = boundary + 1;
       } else {
-        // No newline in this span: split at the cap — but never through a pair
-        // that means one thing on its own.
+        // No eligible boundary in this span: split at the cap — but never
+        // through a pair that means one thing on its own.
         //
         // A surrogate pair is one character held in two UTF-16 units. Split it
         // and both halves become U+FFFD, so the character is lost — the very

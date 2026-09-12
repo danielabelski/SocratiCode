@@ -331,13 +331,14 @@ describe("MAX_CHUNK_CHARS", () => {
       }
     });
 
-    it("keeps the released delimiters for format 0 and 1, not only newlines", async () => {
-      // The released scan also accepts a space, tab, semicolon or comma. The
-      // format-2 splitter accepts a newline only, so a window whose only
-      // delimiter is a semicolon proves the two paths are actually different.
+    it("keeps token-safe delimiters for fresh minified chunks", async () => {
+      // The released scan accepts a space, tab, semicolon or comma as well as a
+      // newline. Fresh indexes keep those boundaries so the character cap does
+      // not divide an identifier when a safe split exists inside the window.
       const { chunkFileContent } = await import("../../src/services/indexer.js");
 
-      const content = `${"a".repeat(300)} ${"b".repeat(300)};${"c".repeat(900)}`;
+      const identifier = "getUserSettlementFactor";
+      const content = `${"a".repeat(579)};${identifier}(${"c".repeat(900)})`;
 
       const legacy = chunkFileContent("/test/min.js", "min.js", content, {
         maxChunkChars: 600,
@@ -348,11 +349,13 @@ describe("MAX_CHUNK_CHARS", () => {
         indexFormatVersion: 2,
       });
 
-      // Legacy ends on the space it found; format 2 has no newline to find and
-      // ends at the cap.
-      expect(legacy[0].content.endsWith(" ")).toBe(true);
-      expect(fresh[0].content.length).toBe(600);
-      expect(legacy[0].content.length).not.toBe(fresh[0].content.length);
+      // A hard split at 600 would cut through the identifier. Both paths end
+      // at the semicolon instead, leaving the complete identifier searchable
+      // in the next chunk.
+      expect(legacy[0].content.endsWith(";")).toBe(true);
+      expect(fresh[0].content.endsWith(";")).toBe(true);
+      expect(fresh.some((chunk) => chunk.content.includes(identifier))).toBe(true);
+      for (const chunk of fresh) expect(chunk.content.length).toBeLessThanOrEqual(600);
 
       // Neither loses a character.
       expect(legacy.map((c) => c.content).join("")).toBe(content);
@@ -443,7 +446,7 @@ describe("MAX_CHUNK_CHARS", () => {
       const noNewlines = "x".repeat(5 * 1024 * 1024);
 
       const startedAt = Date.now();
-      const pieces = splitTextToCharCap(noNewlines, 2000);
+      const pieces = splitTextToCharCap(noNewlines, 2000, "code-token");
       const elapsed = Date.now() - startedAt;
 
       expect(pieces).toHaveLength(Math.ceil(noNewlines.length / 2000));
@@ -485,7 +488,7 @@ describe("MAX_CHUNK_CHARS", () => {
       // 200 characters exactly, with a comma at index 100 — the limit of the
       // first window when the text divides into two pieces of 100.
       const content = `${"x".repeat(100)},${"y".repeat(99)}`;
-      const pieces = splitTextToCharCap(content, 100);
+      const pieces = splitTextToCharCap(content, 100, "code-token");
 
       for (const p of pieces) expect(p.text.length).toBeLessThanOrEqual(100);
       expect(pieces.map((p) => p.text).join("")).toBe(content);
