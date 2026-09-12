@@ -1003,7 +1003,8 @@ export async function getArtifactStatusSummary(projectPath: string): Promise<{
     lines.push(
       `Context index profile: ${profileDifferences.length} requested change${profileDifferences.length === 1 ? "" : "s"} pending until a fresh index: ${profileDifferences.join(", ")}`,
     );
-    // Say what "a fresh index" takes, and that the index is fine until then.
+    // Say what "a fresh index" takes, and that the index remains operational
+    // until then, with the coverage its stored representation provides.
     // Re-indexing applies none of these, but not because it skips work:
     // codebase_context_index rewrites every artifact whether or not it changed.
     // It applies nothing because the collection keeps the profile it was
@@ -1012,7 +1013,7 @@ export async function getArtifactStatusSummary(projectPath: string): Promise<{
     // truncated out of it. Artifacts are the content most likely to have
     // overflowed the cap.
     lines.push(
-      "Context index profile: this index remains fully usable as it is. The collection keeps the profile it was created with, so re-indexing reproduces the stored representation and applies none of these. To apply them, run codebase_context_remove, then codebase_context_index; that is optional.",
+      "Context index profile: this index remains operational with its stored representation. Re-indexing reproduces that representation and applies none of the pending changes. To apply them and update content coverage, run codebase_context_remove, then codebase_context_index; that is optional.",
     );
   }
   if (effectiveProfile.legacyUnverifiedFields.length > 0) {

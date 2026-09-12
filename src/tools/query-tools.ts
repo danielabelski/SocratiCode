@@ -287,16 +287,16 @@ export async function handleQueryTool(
         statusLines.push(
           `Index profile: ${profileDifferences.length} requested change${profileDifferences.length === 1 ? "" : "s"} inactive for this existing index: ${profileDifferences.join(", ")}`,
         );
-        // Say what this does and does not mean. The index stays fully usable:
-        // the collection keeps the profile it was created with, and every write
-        // continues to match it — a changed file is re-chunked the way that
+        // Say what this does and does not mean. The index remains operational
+        // with its stored representation: every write continues to match the
+        // collection's profile, so a changed file is re-chunked the way that
         // profile says, not the way the settings now ask for. That is why
         // re-running codebase_index adopts nothing, and why editing every file
-        // would not either. Only a collection created fresh adopts them, which
-        // for indexFormatVersion is also what recovers content an older index
-        // truncated away.
+        // would not either. Only a collection created fresh adopts the pending
+        // changes, which for indexFormatVersion is also what recovers content
+        // an older index truncated away.
         statusLines.push(
-          "Index profile: this index remains fully usable as it is. The collection keeps the profile it was created with, so re-running codebase_index reproduces the stored representation and adopts none of these. To adopt them, run codebase_remove and then codebase_index; that is optional.",
+          "Index profile: this index remains operational with its stored representation. Re-running codebase_index reproduces that representation and adopts none of the pending changes. To apply them and, for chunk-format changes, improve content coverage, run codebase_remove and then codebase_index; that is optional.",
         );
       }
       if (effectiveProfile.legacyUnverifiedFields.length > 0) {
