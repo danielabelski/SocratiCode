@@ -332,4 +332,40 @@ describe.skipIf(!shouldRun)("content past the character cap is retrievable", () 
       }
     }
   }, 180_000);
+
+  it("keeps a capped minified identifier intact and retrievable", async () => {
+    const project = root;
+    const identifier = "getUserSettlementFactor";
+    // The semicolon is inside the capped window, while a hard split at the cap
+    // would cut the identifier itself. Minified detection selects the
+    // character chunker because this is one long line.
+    const source = `${"a".repeat(MAX_CHUNK_CHARS - 21)};${identifier}=42;`;
+    expect(source.slice(0, MAX_CHUNK_CHARS)).not.toContain(identifier);
+
+    await writeFile(project, "src/settlement.js", source);
+
+    try {
+      await indexProject(project);
+
+      const collection = collectionName(projectIdFromPath(project));
+      const profile = await loadProjectEffectiveProfile(collection);
+      expect(profile?.indexFormatVersion).toBe(2);
+
+      const [top] = await searchChunks(collection, identifier, 1);
+      expect(top, "the search returned nothing for the intact identifier").toBeDefined();
+      expect(top.content).toContain(identifier);
+      expect(top.content.length).toBeLessThanOrEqual(MAX_CHUNK_CHARS);
+    } finally {
+      await cleanupTestCollections(project).catch(() => undefined);
+      const client = createTestQdrantClient();
+      const projectId = projectIdFromPath(project);
+      for (const name of [
+        symgraphMetaCollectionName(projectId),
+        symgraphFileCollectionName(projectId),
+        symgraphIndexCollectionName(projectId),
+      ]) {
+        await client.deleteCollection(name).catch(() => undefined);
+      }
+    }
+  }, 180_000);
 });
