@@ -66,7 +66,7 @@ Use the [Feature Request](https://github.com/giancarloerra/socraticode/issues/ne
 3. **Add tests** — new functionality needs test coverage; bug fixes should include a regression test
 4. **Update documentation** — if your changes affect the public API, update README.md and/or DEVELOPER.md
 5. **Verify** — run `npm run lint && npx tsc --noEmit && npm run test:unit`
-6. **Open a PR** — fill out the pull request template
+6. **Open a PR** — fill out the pull request template; use a draft while the implementation is still changing
 
 ### Commit Message Convention
 
@@ -122,7 +122,10 @@ See [DEVELOPER.md](DEVELOPER.md) for the full architecture overview.
 ## Review Process
 
 - All PRs are reviewed by a maintainer
-- [CodeRabbit](https://coderabbit.ai) automatically reviews every PR — address or resolve all comments before requesting human review
+- Maintainers first confirm that a PR is in scope and stable enough for technical review
+- [CodeRabbit](https://coderabbit.ai) reviews a PR after a maintainer applies the `review-ready` label
+- After review findings, batch related fixes before requesting another review; maintainers trigger follow-up reviews against a stable head
+- Address or resolve all applicable CodeRabbit comments before requesting final human approval
 - CI must pass (tests + type checking)
 - One approval required to merge
 - Maintainers may request changes or suggest alternatives

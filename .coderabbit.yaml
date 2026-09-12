@@ -1,0 +1,7 @@
+reviews:
+  auto_review:
+    enabled: false
+    labels:
+      - review-ready
+    drafts: false
+    auto_incremental_review: false
