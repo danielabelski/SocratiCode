@@ -565,9 +565,9 @@ describe("MAX_CHUNK_CHARS", () => {
       process.env[ENV_KEY] = "300";
       const { chunkFileContent } = await import("../../src/services/indexer.js");
 
-      // 40 lines of 100 characters: 4000 chars over 40 lines keeps the average
-      // line length at 100, below MAX_AVG_LINE_LENGTH, so this is the small-file
-      // path rather than the minified one.
+      // 40 lines of 99 characters: 3999 characters including separators keeps
+      // the average line length below MAX_AVG_LINE_LENGTH, so this is the
+      // small-file path rather than the minified one.
       const lines = Array.from({ length: 40 }, (_, i) => `${String(i + 1).padStart(3, "0")}${"z".repeat(96)}`);
       const chunks = chunkFileContent("/tmp/wide.txt", "wide.txt", lines.join("\n"));
 
@@ -579,7 +579,9 @@ describe("MAX_CHUNK_CHARS", () => {
         expect(c.endLine).toBeLessThanOrEqual(lines.length);
         // The first line of each chunk is the file line its startLine names.
         const firstLine = c.content.split("\n")[0];
-        if (firstLine.length === 100) expect(firstLine).toBe(lines[c.startLine - 1]);
+        if (firstLine.length === lines[0].length) {
+          expect(firstLine).toBe(lines[c.startLine - 1]);
+        }
       }
     });
 
