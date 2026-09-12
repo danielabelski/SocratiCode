@@ -291,11 +291,15 @@ describe("indexer utilities", () => {
       expect(chunks.filter((c) => c.content.trim().length === 0)).toHaveLength(0);
     });
 
-    it("still truncates oversized chunks rather than dropping them", () => {
-      // Guards the other direction: cap-then-filter must not discard real content.
-      const chunks = chunkFileContent("/test/big.txt", "big.txt", "x".repeat(5000));
-      expect(chunks.length).toBeGreaterThan(0);
-      expect(chunks[0].content.length).toBe(2000);
+    it("splits an oversized chunk rather than dropping content", () => {
+      // Guards the other direction: split-then-filter must not discard real content.
+      // 5000 characters with no newline against the default 2000 cap: the pieces
+      // end at the cap, and every character still reaches a chunk.
+      const content = "x".repeat(5000);
+      const chunks = chunkFileContent("/test/big.txt", "big.txt", content);
+
+      expect(chunks.map((c) => c.content).join("")).toBe(content);
+      expect(chunks.map((c) => c.content.length)).toEqual([2000, 2000, 1000]);
     });
 
     it("still chunks ordinary files normally", () => {

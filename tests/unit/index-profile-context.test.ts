@@ -5,7 +5,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { EffectiveIndexProfile } from "../../src/services/index-profile.js";
+import { CURRENT_INDEX_FORMAT_VERSION, type EffectiveIndexProfile } from "../../src/services/index-profile.js";
 import type { ArtifactIndexState } from "../../src/types.js";
 
 let collectionInfo: { pointsCount: number; status: string } | null = null;
@@ -120,6 +120,25 @@ async function loadContextService(overrides: Record<string, string> = {}) {
   return import("../../src/services/context-artifacts.js");
 }
 
+/** Appears once, past the legacy cap, and nowhere else in the fixture. */
+const OVER_CAP_MARKER = "zarquonLegacyTailMarker";
+
+/**
+ * Artifact content past the 2,000-character legacy cap, short enough to stay
+ * one window.
+ *
+ * Content below the cap is stored whole by either representation, so only
+ * content that crosses it shows whether a refresh of an existing collection
+ * truncates as its stored format 0/1 says, or splits as format 2 would.
+ */
+function overCapText(): string {
+  const filler = Array.from(
+    { length: 80 },
+    (_, i) => `line ${String(i).padStart(3, "0")}: settlement factor value ${i}`,
+  ).join("\n");
+  return `${filler}\n${OVER_CAP_MARKER}\n`;
+}
+
 async function createProject(
   artifactPath: string,
   content: string,
@@ -213,6 +232,116 @@ describe("context effective profile compatibility", () => {
       `search_document: context:reference:reference.md\n${content}`,
     );
     expect(String(points[0].payload.content).length).toBeGreaterThan(20);
+  });
+
+  it("truncates an over-cap artifact on a stale refresh while the collection stores format 0", async () => {
+    const service = await loadContextService({ MAX_CHUNK_CHARS: "2000" });
+    const content = overCapText();
+    expect(content.length).toBeGreaterThan(2000);
+    expect(content.slice(0, 2000)).not.toContain(OVER_CAP_MARKER);
+    const project = await createProject("reference.md", content);
+    collectionInfo = { pointsCount: 1, status: "green" };
+    existingStates = [{
+      name: "reference",
+      description: "Reference documentation",
+      resolvedPath: path.join(project, "reference.md"),
+      contentHash: "old-hash",
+      lastIndexedAt: "2026-01-01T00:00:00.000Z",
+      chunksIndexed: 1,
+    }];
+
+    const result = await service.ensureArtifactsIndexed(project);
+
+    expect(result.reindexed).toEqual(["reference"]);
+    const points = upsertedBatches.flat();
+    expect(points).toHaveLength(1);
+    const stored = String(points[0].payload.content);
+    expect(stored).toHaveLength(2000);
+    expect(stored).not.toContain(OVER_CAP_MARKER);
+    // The refresh must leave the collection internally consistent: legacy
+    // representation while the persisted profile still declares format 0.
+    expect(savedMetadata.at(-1)?.profile).toMatchObject({
+      source: "legacy-adopted",
+      indexFormatVersion: 0,
+    });
+  });
+
+  it("truncates an over-cap artifact on a forced refresh while the collection stores format 0", async () => {
+    const service = await loadContextService({ MAX_CHUNK_CHARS: "2000" });
+    const project = await createProject("reference.md", overCapText());
+    collectionInfo = { pointsCount: 1, status: "green" };
+    existingStates = [{
+      name: "reference",
+      description: "Reference documentation",
+      resolvedPath: path.join(project, "reference.md"),
+      contentHash: "old-hash",
+      lastIndexedAt: "2026-01-01T00:00:00.000Z",
+      chunksIndexed: 1,
+    }];
+
+    // codebase_context_index rewrites every artifact whether or not it changed,
+    // so it reaches the chunker on a path the staleness check never gates.
+    const result = await service.indexAllArtifacts(project);
+
+    expect(result.errors).toEqual([]);
+    const points = upsertedBatches.flat();
+    expect(points).toHaveLength(1);
+    const stored = String(points[0].payload.content);
+    expect(stored).toHaveLength(2000);
+    expect(stored).not.toContain(OVER_CAP_MARKER);
+    expect(savedMetadata.at(-1)?.profile.indexFormatVersion).toBe(0);
+  });
+
+  it("splits the same over-cap artifact once the collection stores format 2", async () => {
+    const service = await loadContextService({ MAX_CHUNK_CHARS: "2000" });
+    const { requestedIndexProfile } = await import("../../src/services/index-profile.js");
+    const project = await createProject("reference.md", overCapText());
+    collectionInfo = { pointsCount: 1, status: "green" };
+    storedProfile = requestedIndexProfile("context");
+    existingStates = [{
+      name: "reference",
+      description: "Reference documentation",
+      resolvedPath: path.join(project, "reference.md"),
+      contentHash: "old-hash",
+      lastIndexedAt: "2026-01-01T00:00:00.000Z",
+      chunksIndexed: 1,
+    }];
+
+    const result = await service.ensureArtifactsIndexed(project);
+
+    expect(result.reindexed).toEqual(["reference"]);
+    const points = upsertedBatches.flat();
+    expect(points.length).toBeGreaterThan(1);
+    const stored = points.map((point) => String(point.payload.content));
+    expect(stored.some((text) => text.includes(OVER_CAP_MARKER))).toBe(true);
+    for (const text of stored) expect(text.length).toBeLessThanOrEqual(2000);
+    expect(savedMetadata.at(-1)?.profile.indexFormatVersion).toBe(CURRENT_INDEX_FORMAT_VERSION);
+  });
+
+  it("splits an over-cap artifact on a forced refresh once the collection stores format 2", async () => {
+    const service = await loadContextService({ MAX_CHUNK_CHARS: "2000" });
+    const { requestedIndexProfile } = await import("../../src/services/index-profile.js");
+    const project = await createProject("reference.md", overCapText());
+    collectionInfo = { pointsCount: 1, status: "green" };
+    storedProfile = requestedIndexProfile("context");
+    existingStates = [{
+      name: "reference",
+      description: "Reference documentation",
+      resolvedPath: path.join(project, "reference.md"),
+      contentHash: "old-hash",
+      lastIndexedAt: "2026-01-01T00:00:00.000Z",
+      chunksIndexed: 1,
+    }];
+
+    const result = await service.indexAllArtifacts(project);
+
+    expect(result.errors).toEqual([]);
+    const points = upsertedBatches.flat();
+    expect(points.length).toBeGreaterThan(1);
+    const stored = points.map((point) => String(point.payload.content));
+    expect(stored.some((text) => text.includes(OVER_CAP_MARKER))).toBe(true);
+    for (const text of stored) expect(text.length).toBeLessThanOrEqual(2000);
+    expect(savedMetadata.at(-1)?.profile.indexFormatVersion).toBe(CURRENT_INDEX_FORMAT_VERSION);
   });
 
   it("does not mutate context vectors when the mandatory profile checkpoint fails", async () => {
@@ -368,7 +497,9 @@ describe("context effective profile compatibility", () => {
     expect(result.reindexed).toEqual(["reference"]);
     expect(savedMetadata.at(-1)?.profile).toMatchObject({
       source: "fresh",
-      indexFormatVersion: 1,
+      // The current format version, whatever it is: this asserts that a fresh
+      // index is stamped with this build's version, not a particular number.
+      indexFormatVersion: CURRENT_INDEX_FORMAT_VERSION,
       queryPrefix: "requested-query: ",
       documentPrefix: "requested-document: ",
       documentIncludesPath: false,

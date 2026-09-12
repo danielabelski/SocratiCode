@@ -67,6 +67,13 @@ afterEach(() => {
 });
 
 describe("effective index profile resolution", () => {
+  it("pins the index format version, so a bump is a deliberate change", () => {
+    // The profile tests below compare CURRENT_INDEX_FORMAT_VERSION with itself,
+    // which cannot catch an accidental bump. A bump forces every existing index
+    // to be rebuilt, so it should never happen as a side effect.
+    expect(CURRENT_INDEX_FORMAT_VERSION).toBe(2);
+  });
+
   it("adopts the released representation for a legacy collection without rewriting it", () => {
     const resolved = resolveEffectiveIndexProfile("code", null, true);
 

@@ -5,7 +5,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { EffectiveIndexProfile } from "../../src/services/index-profile.js";
+import { CURRENT_INDEX_FORMAT_VERSION, type EffectiveIndexProfile } from "../../src/services/index-profile.js";
 
 let collectionInfo: { pointsCount: number; status: string } | null = null;
 let storedHashes: Map<string, string> | null = null;
@@ -154,6 +154,25 @@ async function loadIndexer(overrides: Record<string, string> = {}) {
   return import("../../src/services/indexer.js");
 }
 
+/** Appears once, past the legacy cap, and nowhere else in the fixture. */
+const OVER_CAP_MARKER = "zarquonLegacyTailMarker";
+
+/**
+ * A file past the 2,000-character legacy cap, short enough to stay one chunk.
+ *
+ * A fixture below the cap cannot tell the two representations apart: it is
+ * stored whole either way. Only content that crosses the cap shows whether a
+ * write to an existing collection truncates as its stored format 0/1 says, or
+ * splits as format 2 would.
+ */
+function overCapText(): string {
+  const filler = Array.from(
+    { length: 80 },
+    (_, i) => `line ${String(i).padStart(3, "0")}: settlement factor value ${i}`,
+  ).join("\n");
+  return `${filler}\n${OVER_CAP_MARKER}\n`;
+}
+
 async function createProject(relativePath: string, content: string): Promise<string> {
   const project = await fsp.mkdtemp(path.join(tempRoot, "project-"));
   const absolutePath = path.join(project, relativePath);
@@ -249,6 +268,91 @@ describe("code-index effective profile compatibility", () => {
     expect(savedMetadata.at(-1)?.profile.source).toBe("legacy-adopted");
   });
 
+  it("truncates an over-cap changed file while the collection stores format 0", async () => {
+    const indexer = await loadIndexer({ MAX_CHUNK_CHARS: "2000" });
+    const content = overCapText();
+    expect(content.length).toBeGreaterThan(2000);
+    expect(content.slice(0, 2000)).not.toContain(OVER_CAP_MARKER);
+    const project = await createProject("notes.txt", content);
+    collectionInfo = { pointsCount: 1, status: "green" };
+    storedHashes = new Map([["notes.txt", indexer.hashContent("old source")]]);
+
+    const result = await indexer.updateProjectIndex(project);
+
+    expect(result.updated).toBe(1);
+    const points = upsertedBatches.flat();
+    expect(points).toHaveLength(1);
+    const stored = (points[0].payload as { content: string }).content;
+    expect(stored).toHaveLength(2000);
+    expect(stored).not.toContain(OVER_CAP_MARKER);
+    // The emitted representation and the persisted profile agree: an update
+    // must not write format-2 chunks into a collection still declaring 0.
+    expect(savedMetadata.at(-1)?.profile).toMatchObject({
+      source: "legacy-adopted",
+      indexFormatVersion: 0,
+    });
+  });
+
+  it("truncates a newly discovered over-cap file while the collection stores format 0", async () => {
+    const indexer = await loadIndexer({ MAX_CHUNK_CHARS: "2000" });
+    const unchangedContent = "existing source";
+    const project = await createProject("notes.txt", unchangedContent);
+    await fsp.writeFile(path.join(project, "added.txt"), overCapText());
+    collectionInfo = { pointsCount: 1, status: "green" };
+    storedHashes = new Map([["notes.txt", indexer.hashContent(unchangedContent)]]);
+
+    const result = await indexer.updateProjectIndex(project);
+
+    expect(result).toMatchObject({ added: 1, updated: 0 });
+    const points = upsertedBatches.flat();
+    expect(points).toHaveLength(1);
+    const stored = (points[0].payload as { content: string }).content;
+    expect(stored).toHaveLength(2000);
+    expect(stored).not.toContain(OVER_CAP_MARKER);
+    expect(savedMetadata.at(-1)?.profile.indexFormatVersion).toBe(0);
+  });
+
+  it("splits the same over-cap changed file once the collection stores format 2", async () => {
+    const indexer = await loadIndexer({ MAX_CHUNK_CHARS: "2000" });
+    const { requestedIndexProfile } = await import("../../src/services/index-profile.js");
+    const content = overCapText();
+    const project = await createProject("notes.txt", content);
+    collectionInfo = { pointsCount: 1, status: "green" };
+    storedProfile = requestedIndexProfile("code");
+    storedHashes = new Map([["notes.txt", indexer.hashContent("old source")]]);
+
+    const result = await indexer.updateProjectIndex(project);
+
+    expect(result.updated).toBe(1);
+    const points = upsertedBatches.flat();
+    expect(points.length).toBeGreaterThan(1);
+    const stored = points.map((point) => (point.payload as { content: string }).content);
+    expect(stored.some((text) => text.includes(OVER_CAP_MARKER))).toBe(true);
+    for (const text of stored) expect(text.length).toBeLessThanOrEqual(2000);
+    expect(savedMetadata.at(-1)?.profile.indexFormatVersion).toBe(CURRENT_INDEX_FORMAT_VERSION);
+  });
+
+  it("splits a newly discovered over-cap file once the collection stores format 2", async () => {
+    const indexer = await loadIndexer({ MAX_CHUNK_CHARS: "2000" });
+    const { requestedIndexProfile } = await import("../../src/services/index-profile.js");
+    const unchangedContent = "existing source";
+    const project = await createProject("notes.txt", unchangedContent);
+    await fsp.writeFile(path.join(project, "added.txt"), overCapText());
+    collectionInfo = { pointsCount: 1, status: "green" };
+    storedProfile = requestedIndexProfile("code");
+    storedHashes = new Map([["notes.txt", indexer.hashContent(unchangedContent)]]);
+
+    const result = await indexer.updateProjectIndex(project);
+
+    expect(result).toMatchObject({ added: 1, updated: 0 });
+    const points = upsertedBatches.flat();
+    expect(points.length).toBeGreaterThan(1);
+    const stored = points.map((point) => (point.payload as { content: string }).content);
+    expect(stored.some((text) => text.includes(OVER_CAP_MARKER))).toBe(true);
+    for (const text of stored) expect(text.length).toBeLessThanOrEqual(2000);
+    expect(savedMetadata.at(-1)?.profile.indexFormatVersion).toBe(CURRENT_INDEX_FORMAT_VERSION);
+  });
+
   it("does not mutate vectors when the mandatory profile checkpoint fails", async () => {
     const indexer = await loadIndexer();
     const project = await createProject("notes.txt", "changed source content");
@@ -339,7 +443,9 @@ describe("code-index effective profile compatibility", () => {
 
     expect(savedMetadata.at(-1)?.profile).toMatchObject({
       source: "fresh",
-      indexFormatVersion: 1,
+      // The current format version, whatever it is: this asserts that a fresh
+      // index is stamped with this build's version, not a particular number.
+      indexFormatVersion: CURRENT_INDEX_FORMAT_VERSION,
       queryPrefix: "requested-query: ",
       documentPrefix: "requested-document: ",
       documentIncludesPath: false,

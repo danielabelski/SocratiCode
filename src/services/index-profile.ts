@@ -21,7 +21,17 @@ import { getEmbeddingProvider } from "./embedding-provider.js";
 import type { EmbeddingReadinessResult } from "./embedding-types.js";
 
 export const INDEX_PROFILE_SCHEMA_VERSION = 1;
-export const CURRENT_INDEX_FORMAT_VERSION = 1;
+/**
+ * Bumped when a build changes the chunks it produces from unchanged input, so
+ * that an index built by an earlier build is reported as differing from what
+ * this build would produce.
+ *
+ * 2: the per-chunk character cap splits instead of truncating. Indexing skips
+ * files whose content hash is unchanged, so without this an index built by an
+ * earlier version keeps its truncated chunks indefinitely — only edited files
+ * would be re-chunked, leaving the collection quietly mixed.
+ */
+export const CURRENT_INDEX_FORMAT_VERSION = 2;
 
 const LEGACY_QUERY_PREFIX = "search_query: ";
 const LEGACY_DOCUMENT_PREFIX = "search_document: ";

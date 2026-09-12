@@ -654,6 +654,67 @@ describe("chunkArtifactContent", () => {
     // IDs should differ because artifact name and path differ
     expect(c1[0].id).not.toBe(c2[0].id);
   });
+
+  it("splits a window that exceeds the character cap instead of dropping the tail", () => {
+    // Artifacts are chunked by line count and then held to a cap counted in
+    // characters, so a window of CHUNK_SIZE lines can overflow it. 30 lines of
+    // 200 characters is 6030 characters in one window against a 500-char cap.
+    const lines = Array.from({ length: 30 }, (_, i) => `-- ${String(i + 1).padStart(3, "0")} ${"x".repeat(194)}`);
+    const content = lines.join("\n");
+    const chunks = chunkArtifactContent(content, "schema", "./schema.sql", 500);
+
+    // Every character survives, in order, and no chunk exceeds the cap.
+    expect(chunks.map((c) => c.content).join("")).toBe(content);
+    for (const c of chunks) expect(c.content.length).toBeLessThanOrEqual(500);
+
+    // Continuations are addressable: an id collision would make Qdrant's upsert
+    // keep only the last piece of the window.
+    expect(new Set(chunks.map((c) => c.id)).size).toBe(chunks.length);
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    for (const c of chunks) expect(c.id).toMatch(uuidPattern);
+
+    // Line numbers stay inside the artifact and in order.
+    expect(chunks[0].startLine).toBe(1);
+    for (const c of chunks) {
+      expect(c.startLine).toBeGreaterThanOrEqual(1);
+      expect(c.endLine).toBeLessThanOrEqual(lines.length);
+      expect(c.endLine).toBeGreaterThanOrEqual(c.startLine);
+    }
+  });
+
+  it("drops pieces that hold nothing but whitespace", () => {
+    // A window that is mostly padding splits into pieces with no real content.
+    // Each would cost an embedding call, take a point in Qdrant and compete in
+    // search results. One line of SQL followed by 60 lines of spaces is the
+    // shape that produces them.
+    const content = ["SELECT 1;", ...Array.from({ length: 60 }, () => " ".repeat(40))].join("\n");
+    const chunks = chunkArtifactContent(content, "schema", "./schema.sql", 200);
+
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(chunks.filter((c) => c.content.trim().length === 0)).toHaveLength(0);
+    // The real content is still there — dropping blanks must not drop the line
+    // that mattered.
+    expect(chunks.some((c) => c.content.includes("SELECT 1;"))).toBe(true);
+  });
+
+  it("rejects a cap below 1 rather than looping", () => {
+    // maxChunkChars is an argument of this exported function, so a caller can
+    // pass a value the env-var validation would have refused. A cap of 0 would
+    // never advance the split offset.
+    expect(() => chunkArtifactContent("a\nb\nc", "x", "./x.txt", 0)).toThrow(
+      /maxChunkChars must be a positive integer/,
+    );
+  });
+
+  it("leaves content within the cap as one chunk per window", () => {
+    // The common case must not gain chunks: splitting only happens on overflow.
+    const content = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n");
+    const chunks = chunkArtifactContent(content, "notes", "./notes.md", 2000);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].content).toBe(content);
+    expect(chunks[0].startLine).toBe(1);
+    expect(chunks[0].endLine).toBe(30);
+  });
 });
 
 // ── contextCollectionName ────────────────────────────────────────────────

@@ -21,6 +21,12 @@ import {
   SUPPORTED_EXTENSIONS
 } from "../constants.js";
 import type { FileChunk } from "../types.js";
+import {
+  continuationId,
+  SPLITTING_INDEX_FORMAT_VERSION,
+  splitTextToCharCap,
+  uuidFromSeed,
+} from "./chunk-split.js";
 import { ensureDynamicLanguages, gdscriptParserAvailable, getAstGrepLang, rebuildGraph, removeGraph } from "./code-graph.js";
 import { ensureArtifactsIndexed, loadConfig, removeAllArtifacts } from "./context-artifacts.js";
 import { analyzeElixirTemplate, ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir-templates.js";
@@ -28,6 +34,7 @@ import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import {
+  CURRENT_INDEX_FORMAT_VERSION,
   documentTextProfile,
   type EffectiveIndexProfile,
   ensureEffectiveEmbeddingReady,
@@ -387,9 +394,7 @@ export function hashContent(content: string): string {
 
 /** Generate a stable chunk ID as a valid UUID (required by Qdrant) */
 export function chunkId(relativePath: string, startLine: number): string {
-  const hash = createHash("sha256").update(`${relativePath}:${startLine}`).digest("hex").slice(0, 32);
-  // Format as UUID: 8-4-4-4-12
-  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+  return uuidFromSeed(`${relativePath}:${startLine}`);
 }
 
 /** Check if a file should be indexed based on extension or name */
@@ -517,48 +522,162 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
 }
 
 /**
- * Apply a hard character cap to every chunk as a universal safety net.
- * Any chunk whose content exceeds MAX_CHUNK_CHARS is truncated. This is
- * intentionally simple — the provider's pre-truncation is the last-resort
+ * Enforce the per-chunk character cap on every chunking strategy.
+ *
+ * On a collection indexed as format 2 the cap is a split boundary: a chunk
+ * longer than it becomes as many chunks as it needs, and nothing but
+ * whitespace-only pieces is dropped. A collection stored below that keeps
+ * truncating, so its stored representation stays what its profile says.
+ *
+ * Truncation was the behaviour everywhere. Chunks are cut by line count
+ * (CHUNK_SIZE) while the cap counts characters, so a window of CHUNK_SIZE lines
+ * overflows as soon as its lines average more than
+ * MAX_CHUNK_CHARS / CHUNK_SIZE characters — which ordinary source and prose
+ * both do — and everything past the cap reached neither the vector, nor the
+ * payload, nor the BM25 text. No search could retrieve it.
+ *
+ * The provider's pre-truncation still stands behind this as the last-resort
  * defence; this cap ensures chunks are already within bounds before that.
  */
-function applyCharCap(
+function splitToCharCap(
   chunks: FileChunk[],
   maxChunkChars: number = MAX_CHUNK_CHARS,
+  indexFormatVersion: number = CURRENT_INDEX_FORMAT_VERSION,
 ): FileChunk[] {
+  // A collection keeps the representation it was created with. Splitting is the
+  // format-2 representation; a collection stored as format 0 or 1 must keep
+  // truncating, for files that changed and for files discovered after the
+  // upgrade alike, so that what is written never drifts from what its persisted
+  // effective profile says.
+  if (indexFormatVersion < SPLITTING_INDEX_FORMAT_VERSION) {
+    return chunks
+      .map((c) =>
+        c.content.length > maxChunkChars
+          ? { ...c, content: c.content.substring(0, maxChunkChars) }
+          : c,
+      )
+      .filter((c) => c.content.trim().length > 0);
+  }
   // Terminal invariant: never emit a chunk with no non-whitespace content.
   // Four of the five `return` paths in chunkFileContent pass through here (the
   // fifth returns []), so this is the one place that can guarantee the property
   // for every chunking strategy — including zero-byte and whitespace-only files,
   // which reach chunkByLines and would otherwise yield a single blank chunk.
-  // Safe to drop: chunk ids are sha256(relativePath + ":" + startLine), so
+  // Safe to drop: chunk ids are derived from the chunk's own position, so
   // removing a chunk never renumbers any other.
   //
-  // ORDER MATTERS: cap first, then filter. Filtering first lets a chunk whose only
-  // non-whitespace content sits past MAX_CHUNK_CHARS pass the filter and then be
-  // truncated back into a blank chunk, so the invariant would not actually hold.
-  const capped =
+  // ORDER MATTERS: split first, then filter. A chunk can be all whitespace up to
+  // the cap and hold its only real content past it; filtering first would keep
+  // the piece that turns out blank and drop nothing, so the invariant would not
+  // actually hold on the returned chunks.
+  const split =
     chunks.every((c) => c.content.length <= maxChunkChars)
       ? chunks
-      : chunks.map((c) =>
+      : chunks.flatMap((c) =>
           c.content.length > maxChunkChars
-            ? { ...c, content: c.content.substring(0, maxChunkChars) }
-            : c,
+            ? splitOversizedChunk(c, maxChunkChars)
+            : [c],
         );
-  return capped.filter((c) => c.content.trim().length > 0);
+  return split.filter((c) => c.content.trim().length > 0);
+}
+
+/**
+ * Split one over-long chunk into cap-sized pieces.
+ *
+ * Ordinary source and prose use the newline-first boundary rule. Minified code
+ * has a separate token-safe rule in `chunkByCharacters`; routing this path
+ * through that chunker would make ordinary chunks change representation too.
+ * The ids and line numbers here are rebased onto the parent, so the pieces stay
+ * addressable and keep pointing at the lines they came from.
+ */
+function splitOversizedChunk(chunk: FileChunk, maxChunkChars: number): FileChunk[] {
+  // Only reachable for format 2: splitToCharCap returns before this for a
+  // collection stored below it.
+  const pieces = splitTextToCharCap(chunk.content, maxChunkChars);
+  return pieces.map((piece, index) => ({
+    ...chunk,
+    content: piece.text,
+    // The first piece inherits the parent's identity — same id, same startLine —
+    // so a chunk that needed no splitting and one that did agree on where they
+    // begin. Continuations are seeded from the parent id (see continuationId).
+    id: index === 0 ? chunk.id : continuationId(chunk.id, index),
+    // split helper counts lines from 1 within the slice it was given; the
+    // parent's own startLine puts them back on the file's line numbering. This
+    // also re-derives the parent's endLine, which truncation used to leave
+    // claiming lines the chunk no longer held.
+    startLine: chunk.startLine + piece.startLine - 1,
+    // The parent's last piece ends where the parent ended. Deriving it from the
+    // piece instead would come up a line short whenever the parent's final line
+    // is blank: the text then ends on a newline, and a trailing newline closes
+    // the last line rather than opening another. Together the pieces cover the
+    // parent exactly, so the last one has to reach its end.
+    endLine:
+      index === pieces.length - 1 ? chunk.endLine : chunk.startLine + piece.endLine - 1,
+    type: chunk.type,
+  }));
 }
 
 /**
  * Character-based chunking for minified/bundled content whose average line
- * length exceeds MAX_AVG_LINE_LENGTH. Splits at safe token boundaries
- * (newline, space, tab, semicolon, comma) so chunks stay within
- * MAX_CHUNK_CHARS without splitting mid-identifier.
+ * length exceeds MAX_AVG_LINE_LENGTH, so that chunks stay within
+ * MAX_CHUNK_CHARS.
+ *
+ * Where the boundary falls depends on the collection's stored format, because
+ * a collection keeps the representation it was created with. Format 0 and 1
+ * run the released scan, which accepts a newline, space, tab, semicolon or
+ * comma near the end of the window and so usually avoids splitting
+ * mid-identifier. Format 2 preserves that boundary set, but bounds the scan
+ * inside the cap and corrects line-ending and Unicode-pair handling — see
+ * splitTextToCharCap.
  *
  * NOTE: The chunk `id` uses the byte offset as its discriminator (not the
  * line number) because minified files may consist of a single very long
  * line, making startLine identical across all chunks.
  */
 function chunkByCharacters(
+  filePath: string,
+  relativePath: string,
+  content: string,
+  language: string,
+  maxChunkChars: number,
+  indexFormatVersion: number,
+): FileChunk[] {
+  // Format 0 and 1 keep the released algorithm exactly — boundaries, offsets
+  // and ids alike. This path already produces chunks within the cap, so the
+  // gate in splitToCharCap runs too late to restore them; the choice has to be
+  // made here.
+  if (indexFormatVersion < SPLITTING_INDEX_FORMAT_VERSION) {
+    return chunkByCharactersLegacy(filePath, relativePath, content, language, maxChunkChars);
+  }
+
+  let offset = 0;
+  return splitTextToCharCap(content, maxChunkChars, "code-token").map((piece) => {
+    const chunk: FileChunk = {
+      id: chunkId(relativePath, offset), // byte offset → unique ID even for 1-line files
+      filePath,
+      relativePath,
+      content: piece.text,
+      startLine: piece.startLine,
+      endLine: piece.endLine,
+      language,
+      type: "code",
+    };
+    offset += piece.text.length;
+    return chunk;
+  });
+}
+
+/**
+ * The released character-based chunker, kept verbatim for collections stored as
+ * format 0 or 1.
+ *
+ * Its boundary set (newline, space, tab, semicolon, comma) and its scan that
+ * starts at the limit itself decide where every chunk begins, and the chunk id
+ * is seeded from that byte offset. Reproducing the bytes is therefore not
+ * enough: anything but this exact loop gives such a collection different ids
+ * and different line ranges on the next incremental update.
+ */
+function chunkByCharactersLegacy(
   filePath: string,
   relativePath: string,
   content: string,
@@ -623,10 +742,12 @@ export function chunkFileContent(
   options: {
     maxChunkChars?: number;
     extensionLanguageMap?: Map<string, string>;
+    indexFormatVersion?: number;
   } = {},
 ): FileChunk[] {
   const maxChunkChars = options.maxChunkChars ?? MAX_CHUNK_CHARS;
   const extensionLanguageMap = options.extensionLanguageMap ?? EXTENSION_LANGUAGE_MAP;
+  const indexFormatVersion = options.indexFormatVersion ?? CURRENT_INDEX_FORMAT_VERSION;
   const lines = content.split("\n");
   let ext = path.extname(filePath).toLowerCase();
   // Extensionless files (not SPECIAL_FILES) inherit their language/grammar from
@@ -655,15 +776,16 @@ export function chunkFileContent(
       relativePath,
       avgLineLength: Math.round(avgLineLength),
     });
-    return applyCharCap(
-      chunkByCharacters(filePath, relativePath, content, language, maxChunkChars),
+    return splitToCharCap(
+      chunkByCharacters(filePath, relativePath, content, language, maxChunkChars, indexFormatVersion),
       maxChunkChars,
+      indexFormatVersion,
     );
   }
 
   // Small files: single chunk regardless of language
   if (lines.length <= CHUNK_SIZE) {
-    return applyCharCap([{
+    return splitToCharCap([{
       id: chunkId(relativePath, 1),
       filePath,
       relativePath,
@@ -672,7 +794,7 @@ export function chunkFileContent(
       endLine: lines.length,
       language,
       type: "code",
-    }], maxChunkChars);
+    }], maxChunkChars, indexFormatVersion);
   }
 
   // Try AST-aware chunking for supported languages and mixed Elixir templates.
@@ -682,16 +804,18 @@ export function chunkFileContent(
     : astLang ? findAstBoundaries(content, astLang) : [];
 
   if (regions.length > 0) {
-    return applyCharCap(
+    return splitToCharCap(
       chunkByAstRegions(filePath, relativePath, lines, language, regions),
       maxChunkChars,
+      indexFormatVersion,
     );
   }
 
   // Fallback: line-based chunking
-  return applyCharCap(
+  return splitToCharCap(
     chunkByLines(filePath, relativePath, lines, language),
     maxChunkChars,
+    indexFormatVersion,
   );
 }
 
@@ -1064,6 +1188,7 @@ export async function indexProject(
           const chunks = chunkFileContent(absolutePath, relativePath, content, {
             maxChunkChars: effectiveProfile.maxChunkChars,
             extensionLanguageMap: effectiveExtensionMap,
+            indexFormatVersion: effectiveProfile.indexFormatVersion,
           });
           return { relativePath, absolutePath, contentHash, chunks };
         } catch {
@@ -1537,6 +1662,7 @@ export async function updateProjectIndex(
           const chunks = chunkFileContent(absolutePath, relativePath, content, {
             maxChunkChars: effectiveProfile.maxChunkChars,
             extensionLanguageMap: effectiveExtensionMap,
+            indexFormatVersion: effectiveProfile.indexFormatVersion,
           });
           return { relativePath, absolutePath, contentHash, chunks, isNew: !existingHash };
         } catch {

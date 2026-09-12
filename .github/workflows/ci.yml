@@ -103,9 +103,10 @@ jobs:
       # against this job's service container.
       #
       # Name each file rather than the directory: the rest of tests/integration/
-      # needs an embedding service this job does not have. Both files below stub
-      # embedding readiness and generation only — Qdrant and the indexing and
-      # recovery paths stay real.
+      # needs an embedding service this job does not have. The first two stub
+      # embedding readiness and generation; the third serves the embedding
+      # endpoint itself from inside the test. Either way Qdrant and the
+      # indexing, recovery and search paths stay real.
       #
       # REQUIRE_QDRANT=1 makes an unreachable backend fail the job rather than
       # letting describe.skipIf report a skipped success — the same reasoning as
@@ -131,7 +132,8 @@ jobs:
           QDRANT_PORT=6333 \
             npx vitest run \
               tests/integration/partial-upsert-skip.test.ts \
-              tests/integration/interrupted-resume-recovery.test.ts
+              tests/integration/interrupted-resume-recovery.test.ts \
+              tests/integration/char-cap-split-retrieval.test.ts
 
       - name: Verify the unmodified package against Qdrant on Node 26
         shell: bash

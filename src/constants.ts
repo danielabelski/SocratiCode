@@ -193,19 +193,28 @@ const DEFAULT_MAX_CHUNK_CHARS = 2000;
  * it against the model actually in use.
  *
  * Override with MAX_CHUNK_CHARS when the embedding model's context is smaller
- * than the default assumes. `applyCharCap` drops the content past the cap
- * before the chunk is stored, so it reaches neither the vector, nor the
- * payload, nor the BM25 text.
+ * than the default assumes.
  *
- * What the cap does depends on which path `chunkFileContent` takes. On the
- * small-file single-chunk path, `chunkByAstRegions` and `chunkByLines` it only
- * truncates, leaving the chunk count unchanged. On `chunkByCharacters` — the
- * minified/bundled path gated by {@link MAX_AVG_LINE_LENGTH} — the cap is the
- * split boundary instead, so a lower cap produces more chunks.
+ * On a collection indexed as format 2 the cap is a split boundary on every
+ * path, not a truncation point. A collection stored below that version keeps
+ * truncating, so its stored representation stays what its profile says.
+ * `chunkFileContent` and `chunkArtifactContent` both cut by line count
+ * (CHUNK_SIZE), so a chunk can come out longer than a cap counted in
+ * characters; `splitToCharCap` then divides it into as many chunks as it needs.
+ * On format 2 no content is dropped, so a lower cap yields more chunks rather
+ * than less indexed content. (Chunks still overlap where the strategy that produced them
+ * overlaps — CHUNK_OVERLAP lines on the line-based path — and a piece holding
+ * only whitespace is dropped.)
  *
- * Where it truncates on the AST path, the dropped tail is not recovered from
- * the next chunk: `chunkByAstRegions` cuts chunks at top-level declaration
- * boundaries and leaves **no overlap** between adjacent chunks.
+ * It used to truncate on three of the four paths, and that dropped a great deal
+ * of content: a window of CHUNK_SIZE lines overflowed as soon as its lines
+ * averaged more than MAX_CHUNK_CHARS / CHUNK_SIZE characters, which most source
+ * and nearly all prose does. (A file below CHUNK_SIZE lines becomes one chunk
+ * and can stay under the cap regardless of its line lengths.) What was cut
+ * reached neither the vector, nor the payload, nor the BM25 text, and no search
+ * could retrieve it. Continuations do not overlap their parent — as with
+ * adjacent AST chunks, which are cut at top-level declaration boundaries and
+ * leave **no overlap** either.
  *
  * Raising it beyond CHARS_PER_TOKEN_ESTIMATE × model_context_length gains
  * nothing at embed time: the provider pre-truncates, so the extra characters
